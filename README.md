@@ -95,6 +95,7 @@ After creating the enviroment, please download and unzip [FLAME](https://drive.g
     pip install transformers 
     pip install trimesh pyrender pyopengl pyglet opencv-python pyyaml scikit-image wandb matplotlib
     conda install -c conda-forge ffmpeg
+    pip install vector-quantize-pytorch
     ```
 
 4. **Install Chumpy and Datasets**
