@@ -17,19 +17,22 @@ stage=$4
 
 if [ "${stage}" = "s1" ]; then
     echo "TRAINING STAGE 1" 
-    TRAIN_CODE=train_talkinghead-1kh_vq_bs.py
+    TRAIN_CODE=train_joint_data_vq_bs.py #train_talkinghead-1kh_vq_bs.py
     echo "Training for Discrete Motion Prior"
 elif [ "${stage}" = "s2interactive" ]; then
     echo "TRAINING STAGE 2 INTERACTIVE MODE" 
-    TRAIN_CODE=train_joint_data_pred_interactive.py
+    TRAIN_CODE=train_talkinghead-1kh_pred_bs_interactive.py
     echo "Training for Speech-Driven Motion Synthesis (Interactive)"
+elif [ "${stage}" = "s2finetunning" ]; then
+    echo "TRAINING STAGE 2 FINETUNING" 
+    TRAIN_CODE=train_talkinghead-1kh_pred_bs_finetunning.py
+    echo "Training for Speech-Driven Motion Synthesis (Finetuning)"
 else
     echo "TRAINING STAGE 2" 
-    TRAIN_CODE=train_joint_data_pred_bs.py
+    TRAIN_CODE=train_talkinghead-1kh_pred_bs.py
     #TEST_CODE=test_artalk_pred.py
     echo "Training for Speech-Driven Motion Synthesis"
 fi
-
 
 exp_dir=logs/${dataset}/${exp_name}
 model_dir=${exp_dir}/model

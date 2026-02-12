@@ -56,7 +56,7 @@ class VQAutoEncoder(nn.Module):
                                 use_cosine_sim=False,         # Use L2 distance for nearest neighbor search (more stable than cosine for reconstruction)
                                 rotation_trick=False          # Disable rotation trick (orthogonal transform); better stability and interpretability
                             )
-
+        
         self.decoder_transformer = TransformerBlock(dim=hidden_dim)
 
         # Output projection

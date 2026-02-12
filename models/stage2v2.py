@@ -15,87 +15,6 @@ from models.utils import init_biased_mask, enc_dec_mask, enc_dec_mask_simple
 from base import BaseModel
 
 
-class AudioAggregator(nn.Module):
-    """
-    1) De-interleave [B, 200, 1024] into left/right => [B, 100, 1024] each
-    2) Pass each through a small Transformer (num_layers, nhead, ff_dim, dropout)
-    3) Do average pooling over time => [B,1024] for each
-    4) Output shape: [2B, 1024]
-    """
-    def __init__(self, hidden_dim=768, num_layers=2, nhead=4, ff_dim=2048, dropout=0.1):
-        super().__init__()
-        
-        # (A) Define the TransformerEncoderLayer that will process each [T, B, C] sequence
-        encoder_layer_left = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, 
-            nhead=nhead, 
-            dim_feedforward=ff_dim, 
-            dropout=dropout,
-            activation='relu',
-            batch_first=False  # default for nn.Transformer is [T,B,C]
-        )
-        
-        # (B) We'll stack 'num_layers' of these layers
-        self.transformer_encoder_left = nn.TransformerEncoder(encoder_layer_left, num_layers=num_layers)
-
-        # (A) Define the TransformerEncoderLayer that will process each [T, B, C] sequence
-        encoder_layer_right = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, 
-            nhead=nhead, 
-            dim_feedforward=ff_dim, 
-            dropout=dropout,
-            activation='relu',
-            batch_first=False  # default for nn.Transformer is [T,B,C]
-        )
-        
-        # (B) We'll stack 'num_layers' of these layers
-        self.transformer_encoder_right = nn.TransformerEncoder(encoder_layer_right, num_layers=num_layers)
-
-    def _transformer_process(self, x_seq, is_left):
-        """
-        A helper method that:
-          - expects x_seq of shape [B, 100, feature_dim]
-          - transforms it with the TransformerEncoder
-          - returns [B, feature_dim] by averaging over time
-        """
-        B, T, C = x_seq.shape  # e.g. [B,100,feature_dim]
-        
-        # 1) Transpose to [T, B, C] for the Transformer
-        x_seq = x_seq.transpose(0, 1)  # => [T=100, B, C=feature_dim]
-
-        # 2) Forward through the stacked transformer
-        if is_left:
-            x_seq = self.transformer_encoder_left(x_seq)  # => still [T, B, C]
-        else:
-            x_seq = self.transformer_encoder_right(x_seq)
-
-        # 3) Average over time => [B, C]
-        x_seq = x_seq.mean(dim=0)  # => [B, feature_dim]
-
-        return x_seq
-
-    def forward(self, x):
-        """
-        x: [B, 200, feature_dim], with strictly interleaved frames (0->left, 1->right, 2->left, 3->right, ...)
-        Returns: [2B, feature_dim]
-        """
-        B, T, C = x.shape
-
-        # 1) De-interleave => left: x[:, 0::2, :], right: x[:, 1::2, :]
-        x_left  = x[:, 0::2, :]  # => [B, 100, feature_dim]
-        x_right = x[:, 1::2, :]  # => [B, 100, feature_dim]
-
-        # 2) Transform each side
-        left_ctx  = self._transformer_process(x_left, is_left=True)    # => [B, feature_dim]
-        right_ctx = self._transformer_process(x_right, is_left=False)  # => [B, feature_dim]
-
-        # 3) Stack => [B, 2, feature_dim]
-        combined = torch.stack([left_ctx, right_ctx], dim=1)
-
-        # 4) Flatten => [2B, feature_dim]
-        out = combined.view(B * 2, C)
-        return out
-
 class PositionalEncoding(nn.Module):
     def __init__(self, dim, dropout=0.1, max_len=6000):
         super().__init__()
@@ -132,11 +51,14 @@ class AdaLayerNorm(nn.Module):
     def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
         """
         x     : [B, T, D]
-        style : [B, style_dim]
+        style : [B, style_dim] or [B, T, style_dim]
         """
         h = self.norm(x)
-        gamma, beta = self.style2scale(style).chunk(2, dim=-1)  # [B, D] each
-        return gamma.unsqueeze(1) * h + beta.unsqueeze(1)       # broadcast over T
+        scale = self.style2scale(style)
+        gamma, beta = scale.chunk(2, dim=-1)
+        if gamma.dim() == 2:
+            return gamma.unsqueeze(1) * h + beta.unsqueeze(1)   # broadcast over T
+        return gamma * h + beta
 
 
 class FastTalkTransformerDecoderLayerWithADAIN(nn.Module):
@@ -296,21 +218,17 @@ class CodeTalker(BaseModel):
         super(CodeTalker, self).__init__()
         self.args    = args
         self.dataset = args.dataset
-
-        # ======== Audio feature extraction ========
-        self.aggregator = AudioAggregator(hidden_dim=768)
-        num_params      = sum(p.numel() for p in self.aggregator.parameters() if p.requires_grad)
-        print("-----> Number of trainable parameters in AudioAggregator:", num_params)
-
-        self.context_window = args.interactive_window
-        self.hop_length     = args.hop_length
-
+        self.fixed_style = getattr(args, "fixed_style", False)
+        self.fixed_style_path = getattr(args, "fixed_style_path", None)
+        self.register_buffer("fixed_style_seq", torch.empty(0, 58), persistent=True)
+        self._cached_fixed_style_vec = None
         self.audio_encoder = Wav2Vec2Model.from_pretrained(args.wav2vec2model_path)
         print("Loading pretrained: {}".format(args.wav2vec2model_path))
 
         # wav2vec 2.0 weights initialization
-        #self.audio_encoder.feature_extractor._freeze_parameters()   
+        self.audio_encoder.feature_extractor._freeze_parameters()   
         
+
         self.audio_feature_map = nn.Linear(768, args.feature_dim)
 
         # motion encoder
@@ -347,6 +265,41 @@ class CodeTalker(BaseModel):
                                                             nn.TransformerEncoderLayer(d_model=1024, nhead=4, batch_first=True),
                                                             num_layers=2
                                                         )
+        self.style_audio_attn = nn.MultiheadAttention(
+                                                        args.feature_dim,
+                                                        args.n_head,
+                                                        batch_first=True,
+                                                    )
+        self.style_audio_gate = nn.Parameter(torch.zeros(1))
+        if self.fixed_style:
+            self.fixed_style_token = nn.Parameter(torch.zeros(1, style_dim))
+            nn.init.zeros_(self.fixed_style_token)
+
+        if self.fixed_style_path and self.fixed_style_seq.numel() == 0:
+            loaded = torch.load(self.fixed_style_path, map_location="cpu")
+            if isinstance(loaded, dict) and "expression_params" in loaded:
+                expr = loaded["expression_params"].reshape(-1, 50)
+                gpose = loaded.get("pose_params", loaded.get("gpose", None))
+                if gpose is None:
+                    raise ValueError("fixed_style_path missing pose parameters.")
+                gpose = gpose.reshape(-1, 3)
+                jaw = loaded.get("jaw_params", loaded.get("jaw", None))
+                if jaw is None:
+                    raise ValueError("fixed_style_path missing jaw parameters.")
+                jaw = jaw.reshape(-1, 3)
+                eyelids = torch.ones((expr.shape[0], 2), dtype=torch.float32)
+                expr = torch.as_tensor(expr, dtype=torch.float32)
+                gpose = torch.as_tensor(gpose, dtype=torch.float32)
+                jaw = torch.as_tensor(jaw, dtype=torch.float32)
+                self.fixed_style_seq = torch.cat([expr, gpose, jaw, eyelids], dim=-1)
+            else:
+                seq = torch.as_tensor(loaded, dtype=torch.float32)
+                if seq.dim() == 2:
+                    self.fixed_style_seq = seq
+                elif seq.dim() == 3:
+                    self.fixed_style_seq = seq[0]
+                else:
+                    raise ValueError("fixed_style_path must be [T,58] or [1,T,58]")
 
         # motion decoder
         # self.feat_map = nn.Linear(args.feature_dim, 512, bias=False)
@@ -362,24 +315,6 @@ class CodeTalker(BaseModel):
         print("Loading pretrained vq: {}".format(args.vqvae_pretrained_path))
 
         for param in self.autoencoder.parameters():
-            param.requires_grad = False
-
-        #for param in self.audio_feature_map.parameters():
-        #    param.requires_grad = False
-        
-        for param in self.blendshapes_map.parameters():
-            param.requires_grad = False
-        
-        for param in self.transformer_decoder.parameters():
-            param.requires_grad = False
-        
-        for param in self.style_proj.parameters():
-            param.requires_grad = False
-
-        for param in self.style_frame_encoder.parameters():
-            param.requires_grad = False
-        
-        for param in self.feat_map.parameters():
             param.requires_grad = False
 
 
@@ -402,6 +337,69 @@ class CodeTalker(BaseModel):
         style_vec = feats.sum(1) / (mask.sum(1, keepdim=True) + 1e-6)  # [B, 1024]
 
         return F.normalize(style_vec, dim=-1)
+
+
+    def _get_fixed_style_vec(self, device, dtype):
+        if self.fixed_style_seq.numel() == 0:
+            return None
+        if self._cached_fixed_style_vec is not None and self._cached_fixed_style_vec.device == device and self._cached_fixed_style_vec.dtype == dtype:
+            return self._cached_fixed_style_vec
+        with torch.no_grad():
+            style_seq = self.fixed_style_seq.to(device=device, dtype=dtype).unsqueeze(0)
+            style_mask = torch.ones(style_seq.shape[:2], dtype=torch.bool, device=device)
+            feat_q_gt, _, _ = self.autoencoder.get_quant(style_seq, style_mask)
+            style_feats = self.style_proj(feat_q_gt)
+            style_feats = self.pos_enc(style_feats)
+            style_feats = self.style_frame_encoder(style_feats)
+            style_vec = F.normalize(style_feats.mean(dim=1), dim=-1)
+        self._cached_fixed_style_vec = style_vec.detach()
+        return style_vec
+
+
+    def _style_seq_from_target(self, target_style: torch.Tensor, target_len: int) -> torch.Tensor:
+        """
+        target_style: [B, T, 58]
+        returns     : [B, target_len, D] (per-frame style sequence)
+        """
+        target_mask = torch.ones_like(target_style[..., 0], dtype=torch.bool)
+        feat_q_gt, _, _ = self.autoencoder.get_quant(target_style, target_mask)
+        style_feats = self.style_proj(feat_q_gt)
+        style_feats = self.pos_enc(style_feats)
+        style_feats = self.style_frame_encoder(style_feats)
+        if style_feats.shape[1] != target_len:
+            style_feats = F.interpolate(
+                style_feats.transpose(1, 2),
+                size=target_len,
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
+        return F.normalize(style_feats, dim=-1)
+
+
+    def _fuse_style_with_audio(self, style_seq: torch.Tensor, hidden_states: torch.Tensor, memory_key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        style_seq    : [B, T, D]
+        hidden_states: [B, S, D]
+        returns      : [B, T, D]
+        """
+        attn_mask = None
+        if getattr(self.args, "style_audio_causal", False):
+            t_len = style_seq.shape[1]
+            s_len = hidden_states.shape[1]
+            ratio = max(s_len / max(t_len, 1), 1e-6)
+            t_idx = torch.arange(t_len, device=style_seq.device).unsqueeze(1)
+            s_idx = torch.arange(s_len, device=style_seq.device).unsqueeze(0)
+            max_s = torch.floor((t_idx + 1) * ratio - 1).clamp(min=0, max=s_len - 1)
+            attn_mask = s_idx > max_s
+        attn_out, _ = self.style_audio_attn(
+            query=style_seq,
+            key=hidden_states,
+            value=hidden_states,
+            attn_mask=attn_mask,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=False,
+        )
+        return style_seq + self.style_audio_gate * attn_out
     
 
     def _make_two_views(self, blend, mask, crop_ratio=0.8):
@@ -452,34 +450,13 @@ class CodeTalker(BaseModel):
 
     def forward(self, padded_blendshapes, blendshapes_mask, padded_audios, audio_mask, criterion, target_style=None):
         B, T, D = padded_blendshapes.shape  # D = 58
-        
-        # Remove unnecessary singleton dimension: [B, 1, N] -> [B, N]
-        padded_audios = padded_audios.squeeze(1)
 
         # ========== AUDIO FEATURES EXTRACTION ==========
-        # Compute the total padded length
-        hop_length_int = padded_audios.shape[-1] // T  # Compute hop length for frames
-        padding_length = (self.context_window - 1) * hop_length_int
-
-        # Interactive audio preparation
-        # Pad the start of audio with zeros for sliding window effect
-        padded_audios_init_zeros = torch.nn.functional.pad(
-            padded_audios, (padding_length,0), "constant", 0
-        )
-
-        # Generate overlapping sliding windows
-        sliding_chunks_audio_features = torch.cat(
-            [
-                padded_audios_init_zeros[:, i * hop_length_int : i * hop_length_int + self.context_window * hop_length_int]
-                for i in range(T)
-            ],
-            dim=0,
-        )
-
-        # 2) Compute audio features per chunk -> aggregate them
-        hidden_states_wav2vec = self.audio_encoder(sliding_chunks_audio_features).last_hidden_state #Wav2Vec
-
-        hidden_states = self.aggregator(hidden_states_wav2vec).unsqueeze(0)
+        # Remove unnecessary singleton dimension: [B, 1, N] -> [B, N]
+        padded_audios = padded_audios.squeeze(1)
+        
+        # Extract audio features using Wav2Vec2
+        hidden_states = self.audio_encoder(padded_audios, attention_mask=audio_mask).last_hidden_state  # [B, T_audio, D]
 
         hidden_states = self.audio_feature_map(hidden_states)
         _, T_audio, _ = hidden_states.shape
@@ -492,17 +469,23 @@ class CodeTalker(BaseModel):
 
         # ========== AUDIO FEATURES EXTRACTION ==========
 
-
         # ── Style ──────────────────────────────────────────────────────
         feat_q_gt, _, encoded = self.autoencoder.get_quant(padded_blendshapes, blendshapes_mask) # Autoencoder embedded features
 
-        # --- build two cropped views ------------------------------------------------
-        (view1, m1), (view2, m2) = self._make_two_views(feat_q_gt.detach(), blendshapes_mask)
-        style_a = self._style_view(view1, m1)          # [B, D]
-        style_b = self._style_view(view2, m2)          # [B, D]
+        if self.fixed_style:
+            style_vec = self._get_fixed_style_vec(padded_blendshapes.device, padded_blendshapes.dtype)
+            if style_vec is None:
+                style_vec = self.fixed_style_token.expand(B, -1)
+            loss_style = torch.zeros((), device=padded_blendshapes.device)
+        else:
+            # --- build two cropped views ------------------------------------------------
+            (view1, m1), (view2, m2) = self._make_two_views(feat_q_gt.detach(), blendshapes_mask)
+            style_a = self._style_view(view1, m1)          # [B, D]
+            style_b = self._style_view(view2, m2)          # [B, D]
 
-        # pick one view (or their average) for conditioning
-        style_vec = (style_a + style_b) * 0.5          
+            # pick one view (random per-sample) for conditioning
+            pick_a = torch.rand(style_a.shape[0], 1, device=style_a.device) < 0.5
+            style_vec = torch.where(pick_a, style_a, style_b)
        
         # ========== AUTOREGRESSIVE ==========
         # Create one frame of 0s and shift right the blendshapes by one frame, insert the 0s
@@ -520,10 +503,21 @@ class CodeTalker(BaseModel):
      
         # ========== DECODER FOR AUTOREGRESSIVE PREDICTION ==========
         # During forward / predict:
+        style_for_dec = style_vec
+        if getattr(self.args, "use_temporal_style", False):
+            alpha = getattr(self.args, "temporal_style_alpha", 1.0)
+            style_drop_prob = getattr(self.args, "style_dropout_prob", 0.0)
+            if self.training and style_drop_prob > 0 and torch.rand((), device=style_vec.device) < style_drop_prob:
+                style_for_dec = style_vec
+            else:
+                style_seq = self._style_seq_from_target(padded_blendshapes, emb_blendshapes_tgt.shape[1])
+                style_seq = self._fuse_style_with_audio(style_seq, hidden_states, memory_key_padding_mask)
+                style_for_dec = (1.0 - alpha) * style_vec.unsqueeze(1) + alpha * style_seq
+        
         feat_out = self.transformer_decoder(
                                                 tgt=emb_blendshapes_tgt,
                                                 memory=hidden_states,
-                                                style=style_vec,               #  pass style once
+                                                style=style_for_dec,
                                                 tgt_mask=tgt_mask,
                                                 memory_mask=memory_mask,
                                                 tgt_key_padding_mask=~blendshapes_mask,
@@ -542,53 +536,36 @@ class CodeTalker(BaseModel):
         loss_blendshapes = criterion(blendshapes_out, padded_blendshapes)  # L2 loss
       
         # --- add self-supervised style compactness ---------------------------------
-        loss_style = self.nt_xent_unsup(style_a, style_b)
+        if not self.fixed_style:
+            loss_style = self.nt_xent_unsup(style_a, style_b)
 
         return loss_blendshapes + loss_reg + 0.001 * loss_style,  [loss_blendshapes, loss_reg, loss_style, loss_reg]#, blendshapes_out #+  0.01 * nt_xent_loss,
     
 
-    def predict_no_quantizer(self, audio, target_style=None):
+    def predict(self, audio, target_style=None):
         audio = audio.squeeze(1)
 
-        # Compute the total padded length
-        frame_num = audio.shape[-1] // self.hop_length  # Compute hop length for frames
-        padding_length = (self.context_window - 1) * self.hop_length 
-
-        # Interactive audio preparation
-        # Pad the start of audio with zeros for sliding window effect
-        padded_audios_init_zeros = torch.nn.functional.pad(
-            audio, (padding_length,0), "constant", 0
-        )
-
-        # Generate overlapping sliding windows
-        sliding_chunks_audio_features = torch.cat(
-            [
-                padded_audios_init_zeros[:, i * self.hop_length : i * self.hop_length + self.context_window * self.hop_length]
-                for i in range(frame_num)
-            ],
-            dim=0,
-        )
-
-
         # Extract audio features using Wav2Vec2
-        hidden_states_wav2vec = self.audio_encoder(sliding_chunks_audio_features).last_hidden_state #Wav2Vec
-
-        hidden_states = self.aggregator(hidden_states_wav2vec).unsqueeze(0)
-
+        hidden_states = self.audio_encoder(audio).last_hidden_state  # [B, T_audio, D]
         hidden_states = self.audio_feature_map(hidden_states)
 
+        frame_num = hidden_states.shape[1]//2
 
         #  Build style_vec once per batch ───────────────────────────────
-        if target_style is not None:
-            feat_q_gt, _, encoded = self.autoencoder.get_quant(target_style, torch.ones_like(target_style[...,0], dtype=torch.bool))
-            style_feats = self.style_proj(feat_q_gt) 
-            style_feats = self.pos_enc(style_feats) 
-            style_feats = self.style_frame_encoder(style_feats)    
-            style_vec   = style_feats.mean(dim=1)       
-            style_vec   = F.normalize(style_vec, dim=-1)   
+        style_seq = None
+        if self.fixed_style:
+            style_vec = self._get_fixed_style_vec(hidden_states.device, hidden_states.dtype)
+            if style_vec is None:
+                style_vec = self.fixed_style_token.expand(hidden_states.shape[0], -1)
+        elif target_style is not None:
+            style_seq = self._style_seq_from_target(target_style, frame_num)
+            style_vec = style_seq.mean(dim=1)
         else:
             # fallback: a learnable "neutral" token (could also be zeros)
             style_vec = torch.zeros(1, self.args.feature_dim, device=self.device, dtype=hidden_states.dtype)
+
+        if style_seq is not None:
+            style_seq = self._fuse_style_with_audio(style_seq, hidden_states, None)
 
         # autoregressive facial motion prediction
         for i in range(frame_num):
@@ -601,12 +578,80 @@ class CodeTalker(BaseModel):
             tgt_mask    = self.biased_mask[:, :blendshapes_input.shape[1], :blendshapes_input.shape[1]].clone().detach().to(device=self.device).squeeze(0)
             memory_mask = enc_dec_mask(self.device, self.dataset, blendshapes_input.shape[1], hidden_states.shape[1])
 
+            alpha = getattr(self.args, "temporal_style_alpha", 1.0)
+            style_for_dec = style_vec if style_seq is None else (1.0 - alpha) * style_vec.unsqueeze(1) + alpha * style_seq[:, :blendshapes_input.shape[1], :]
             feat_out = self.transformer_decoder(
                                                 tgt=blendshapes_input,
                                                 memory=hidden_states,
                                                 tgt_mask=tgt_mask, 
                                                 memory_mask=memory_mask,
-                                                style   = style_vec,
+                                                style   = style_for_dec,
+                                                )
+
+            feat_out         = self.feat_map(feat_out) # Map the output features to the final feature space (VQAutoencoder 'embedding') 
+            feat_out_q, _, _ = self.autoencoder.vq(feat_out) # Quantize the embedding
+
+            # Quantized features to blendshapes
+            if i == 0:
+                blendshapes_out_q = self.autoencoder.decode(torch.cat([feat_out_q, feat_out_q], dim=1))
+                blendshapes_out_q = blendshapes_out_q[:,0].unsqueeze(1)
+            else:
+                blendshapes_out_q = self.autoencoder.decode(feat_out_q)
+
+            if i != frame_num - 1:
+                new_output        = self.blendshapes_map(blendshapes_out_q[:,-1,:]).unsqueeze(1)
+                blendshapes_emb   = torch.cat((blendshapes_emb, new_output), 1)
+                
+        # quantization and decoding
+        feat_out_q, _, _ = self.autoencoder.vq(feat_out)
+        blendshapes_out  = self.autoencoder.decode(feat_out_q)
+
+        return blendshapes_out
+
+    def predict_no_quantizer(self, audio, target_style=None):
+        audio = audio.squeeze(1)
+
+        # Extract audio features using Wav2Vec2
+        hidden_states = self.audio_encoder(audio).last_hidden_state  # [B, T_audio, D]
+        hidden_states = self.audio_feature_map(hidden_states)
+
+        frame_num = hidden_states.shape[1]//2
+
+        #  Build style_vec once per batch ───────────────────────────────
+        style_seq = None
+        if self.fixed_style:
+            style_vec = self._get_fixed_style_vec(hidden_states.device, hidden_states.dtype)
+            if style_vec is None:
+                style_vec = self.fixed_style_token.expand(hidden_states.shape[0], -1)
+        elif target_style is not None:
+            style_seq = self._style_seq_from_target(target_style, frame_num)
+            style_vec = style_seq.mean(dim=1)
+        else:
+            # fallback: a learnable "neutral" token (could also be zeros)
+            style_vec = torch.zeros(1, self.args.feature_dim, device=self.device, dtype=hidden_states.dtype)
+
+        if style_seq is not None:
+            style_seq = self._fuse_style_with_audio(style_seq, hidden_states, None)
+
+        # autoregressive facial motion prediction
+        for i in range(frame_num):
+            if i==0:
+                blendshapes_emb   = torch.zeros((1,1,self.args.feature_dim)).to(self.device) # (1,1,feature_dim)
+                blendshapes_input = self.pos_enc(blendshapes_emb)
+            else:
+                blendshapes_input = self.pos_enc(blendshapes_emb)
+
+            tgt_mask    = self.biased_mask[:, :blendshapes_input.shape[1], :blendshapes_input.shape[1]].clone().detach().to(device=self.device).squeeze(0)
+            memory_mask = enc_dec_mask(self.device, self.dataset, blendshapes_input.shape[1], hidden_states.shape[1])
+
+            alpha = getattr(self.args, "temporal_style_alpha", 1.0)
+            style_for_dec = style_vec if style_seq is None else (1.0 - alpha) * style_vec.unsqueeze(1) + alpha * style_seq[:, :blendshapes_input.shape[1], :]
+            feat_out = self.transformer_decoder(
+                                                tgt=blendshapes_input,
+                                                memory=hidden_states,
+                                                tgt_mask=tgt_mask, 
+                                                memory_mask=memory_mask,
+                                                style   = style_for_dec,
                                                 )
 
             feat_out         = self.feat_map(feat_out) # Map the output features to the final feature space (VQAutoencoder 'embedding') 
@@ -630,223 +675,4 @@ class CodeTalker(BaseModel):
         return blendshapes_out
 
 
-def print_gpu_memory(tag=""):
-    if torch.cuda.is_available():
-        print(f"[{tag}] VRAM used: {torch.cuda.memory_allocated() / 1024 ** 2:.2f} MB "
-              f"| reserved: {torch.cuda.memory_reserved() / 1024 ** 2:.2f} MB")
 
-
-
-class CodeTalkerOLD(BaseModel):
-    def __init__(self, args):
-        super(CodeTalker, self).__init__()
-        """
-        audio: (batch_size, raw_wav)
-        vertice: (batch_size, seq_len, V*3)
-        """
-        self.args = args
-        self.dataset = args.dataset
-        self.context_window = args.interactive_window
-        self.hop_length = args.hop_length
-
-        # ======== Audio feature extraction ========
-        self.aggregator = AudioAggregator(hidden_dim=1024)
-        num_params      = sum(p.numel() for p in self.aggregator.parameters() if p.requires_grad)
-        print("-----> Number of trainable parameters in AudioAggregator:", num_params)
-
-        self.audio_encoder = AutoModel.from_pretrained(args.wav2vec2model_path)
-
-        # wav2vec 2.0 weights initialization
-        self.audio_encoder.feature_extractor._freeze_parameters()
-        self.audio_feature_map = nn.Linear(1024, args.feature_dim)
-
-        # motion encoder
-        self.vertice_map = nn.Linear(args.vertice_dim, args.feature_dim)
-        # periodic positional encoding
-        self.PPE = PeriodicPositionalEncoding(args.feature_dim, period = args.period)
-        # temporal bias
-        self.biased_mask = init_biased_mask(n_head = 4, max_seq_len = 600, period=args.period)
-        decoder_layer = nn.TransformerDecoderLayer(d_model=args.feature_dim, nhead=args.n_head, dim_feedforward=2*args.feature_dim, batch_first=True)
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=args.num_layers)
-        # motion decoder
-        self.feat_map = nn.Linear(args.feature_dim, args.face_quan_num*args.zquant_dim, bias=False)
-        # style embedding
-        self.learnable_style_emb = nn.Embedding(len(args.train_subjects.split()), args.feature_dim)
-
-        self.device = args.device
-        nn.init.constant_(self.feat_map.weight, 0)
-        # nn.init.constant_(self.feat_map.bias, 0)
-
-        # VQ-AUTOENCODER
-        from models.stage1_vocaset import VQAutoEncoder
-
-        self.autoencoder = VQAutoEncoder(args)
-        temp = torch.load(args.vqvae_pretrained_path)['state_dict']
-
-        self.autoencoder.load_state_dict(torch.load(args.vqvae_pretrained_path)['state_dict'])
-        for param in self.autoencoder.parameters():
-            param.requires_grad = False
-
-        # Put all to sleep ===========
-        #for param in self.audio_encoder.parameters():
-        #    param.requires_grad = False
-
-        for param in self.audio_feature_map.parameters():
-            param.requires_grad = False
-
-        for param in self.vertice_map.parameters():
-            param.requires_grad = False
-        
-        for param in self.transformer_decoder.parameters(): # Blendshape Transformer
-            param.requires_grad = False
-        
-        for param in self.feat_map.parameters():
-            param.requires_grad = False
-
-    def computeAudioFeatures(self, sliding_chunks_audio_features):
-
-        hidden_states_wav2vec = self.audio_encoder(sliding_chunks_audio_features).last_hidden_state #Wav2Vec
-
-        aggregated_states = self.aggregator(hidden_states_wav2vec)
-
-        return aggregated_states.unsqueeze(0)
-
-
-    def forward(self, audio_name, audio, audio_features, vertice, blendshapes, template, criterion):
-
-        frame_num = vertice.shape[1]
-        template  = template.unsqueeze(1) # (1,1,V*3)
-        
-        # ======== Audio feature extraction ========
-        # 1) Create sliding window, padding with 0s at the initial frames  ==============================
-        # Compute the total padded length
-        hop_length_int = audio_features.shape[-1] // frame_num  # Compute hop length for frames
-        padding_length = (self.context_window - 1) * hop_length_int
-
-        # Pad the start of audio with zeros for sliding window effect
-        padded_audio_features = torch.nn.functional.pad(
-            audio_features, (padding_length,0), "constant", 0
-        )
-
-        # Generate overlapping sliding windows
-        sliding_chunks_audio_features = torch.cat(
-            [
-                padded_audio_features[:, i * hop_length_int : i * hop_length_int + self.context_window * hop_length_int]
-                for i in range(frame_num)
-            ],
-            dim=0,
-        )
-
-        # 2) Compute audio features [frames, n_mfcc] ======================================
-        hidden_states_agg = self.computeAudioFeatures(sliding_chunks_audio_features)
-
-        if hidden_states_agg.shape[1]<frame_num*2:
-            vertice      = vertice[:, :hidden_states_agg.shape[1]//2]
-            blendshapes  = blendshapes[:, :hidden_states_agg.shape[1]//2]
-            frame_num    = hidden_states_agg.shape[1]//2
-
-        hidden_states = self.audio_feature_map(hidden_states_agg)
-
-        # gt motion feature extraction
-        feat_q_gt, _ = self.autoencoder.get_quant(vertice - template, blendshapes)
-        feat_q_gt    = feat_q_gt.permute(0,2,1)
-
-        # prepare vertices
-        vertice_input = torch.cat((template,vertice[:,:-1]), 1) # shift one position
-        vertice_input = vertice_input - template
-
-        # prepare blendshapes
-        blendshapes_input  = torch.cat((torch.zeros(1,1,blendshapes.shape[2]).cuda(self.args.gpu),blendshapes[:,:-1]),1)
-
-        # cat both (for teacher forcing)
-        vertice_blendshapes_input = torch.cat((vertice_input, blendshapes_input), dim=-1)
-
-        vertice_input = self.vertice_map(vertice_blendshapes_input)
-
-        vertice_input = self.PPE(vertice_input)
-        tgt_mask = self.biased_mask[:, :vertice_input.shape[1], :vertice_input.shape[1]].clone().detach().to(device=self.device)
-        memory_mask = enc_dec_mask(self.device, self.dataset, vertice_input.shape[1], hidden_states.shape[1])
-        feat_out = self.transformer_decoder(vertice_input, hidden_states, tgt_mask=tgt_mask, memory_mask=memory_mask)
-        feat_out = self.feat_map(feat_out)
-        feat_out = feat_out.reshape(feat_out.shape[0], feat_out.shape[1]*self.args.face_quan_num, -1)
-        # feature quantization
-        feat_out_q, _, _ = self.autoencoder.quantize(feat_out)
-        # feature decoding
-        vertice_blendshapes_out = self.autoencoder.decode(feat_out_q)
-
-        vertice_dec, blendshapes_out = torch.split(vertice_blendshapes_out, [15069,56], dim=2)
-        vertice_out = vertice_dec + template
-
-        # loss
-        loss_vert = criterion(vertice_out, vertice) # (batch, seq_len, V*3)
-        loss_blendshapes = criterion(blendshapes_out, blendshapes) #criterion(blendshapes.clone(), blendshapes)#
-        loss_reg  = criterion(feat_out, feat_q_gt.detach())
-
-        return self.args.motion_weight*loss_vert + 0.001*loss_blendshapes + self.args.reg_weight*loss_reg, [loss_vert, loss_blendshapes, loss_reg, loss_vert]
-
-
-    def predict(self, audio_features, template):
-        template = template.unsqueeze(1) # (1,1, V*3)
-
-        # Compute the total padded length
-        frame_num      = audio_features.shape[-1] // self.hop_length
-        padding_length = (self.context_window - 1) * self.hop_length
-
-        # Pad the start and end of audio with zeros for sliding window effect
-        padded_audio_features = torch.nn.functional.pad(
-            audio_features, (padding_length, 0), "constant", 0
-        )
-
-        # Generate overlapping sliding windows
-        sliding_chunks_audio_features = torch.cat(
-            [
-                padded_audio_features[:, i * self.hop_length : i * self.hop_length + self.context_window * self.hop_length]
-                for i in range(frame_num)
-            ],
-            dim=0,
-        )
-
-        # ->> 3) Compute audio features [frames, n_mfcc] ======================================
-        hidden_states_agg = self.computeAudioFeatures(sliding_chunks_audio_features)
-
-        hidden_states = self.audio_feature_map(hidden_states_agg)
-        
-        # autoregressive facial motion prediction
-        for i in range(frame_num):
-            if i==0:
-                vertice_emb = torch.zeros((1,1,self.args.feature_dim)).to(self.device) # (1,1,feature_dim)
-                vertice_input = self.PPE(vertice_emb)
-            else:
-                vertice_input = self.PPE(vertice_emb)
-            tgt_mask = self.biased_mask[:, :vertice_input.shape[1], :vertice_input.shape[1]].clone().detach().to(device=self.device)
-            memory_mask = enc_dec_mask(self.device, self.dataset, vertice_input.shape[1], hidden_states.shape[1])
-            feat_out = self.transformer_decoder(vertice_input, hidden_states, tgt_mask=tgt_mask, memory_mask=memory_mask)
-            feat_out = self.feat_map(feat_out)
-
-            feat_out = feat_out.reshape(feat_out.shape[0], feat_out.shape[1]*self.args.face_quan_num, -1)
-            # predicted feature to quantized one
-            feat_out_q, _, _ = self.autoencoder.quantize(feat_out)
-            # quantized feature to vertice
-            if i == 0:
-                vertice_blendshapes_out_q = self.autoencoder.decode(torch.cat([feat_out_q, feat_out_q], dim=-1))
-                vertice_out_q, blendshapes_out_q = torch.split(vertice_blendshapes_out_q, [15069,56], dim=2)
-                vertice_out_q = vertice_out_q[:,0].unsqueeze(1)
-                blendshapes_out_q    = blendshapes_out_q[:,0].unsqueeze(1)
-            else:
-                vertice_blendshapes_out_q = self.autoencoder.decode(feat_out_q)
-                vertice_out_q, blendshapes_out_q = torch.split(vertice_blendshapes_out_q, [15069,56], dim=2)
-
-            if i != frame_num - 1:
-                vertice_blendshapes_input = torch.cat((vertice_out_q, blendshapes_out_q), dim=-1)
-                new_output = self.vertice_map(vertice_blendshapes_input[:,-1,:]).unsqueeze(1)
-                vertice_emb = torch.cat((vertice_emb, new_output), 1)
-
-        # quantization and decoding
-        feat_out_q, _, _ = self.autoencoder.quantize(feat_out)
-
-        vertice_blendshapes_out = self.autoencoder.decode(feat_out_q)
-        vertice_out, blendshapes_out= torch.split(vertice_blendshapes_out, [15069,56], dim=2)
-
-        vertice_out = vertice_out + template
-
-        return vertice_out, blendshapes_out

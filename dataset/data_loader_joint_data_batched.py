@@ -81,6 +81,9 @@ def read_data(args, test_config=False):
 
     audio_path = os.path.join(args.data_root, args.wav_path)
     vertices_path = os.path.join(args.data_root, args.vertices_path)
+    print("Data root:", args.data_root)
+    print("Audio path:", audio_path)
+    print("Vertices path:", vertices_path)
     
     template_file = torch.load(args.template_file, map_location="cpu")
     templates = template_file['flame_model']
@@ -100,70 +103,117 @@ def read_data(args, test_config=False):
     train_txt = open(os.path.join(args.data_root,"train.txt"), "r")
     test_txt  = open(os.path.join(args.data_root,"test.txt"), "r")
     train_lines, test_lines, train_list, test_list = train_txt.readlines(), test_txt.readlines(), [], []
+    print("Train lines read:", len(train_lines))
+    print("Test lines read:", len(test_lines))
 
     for tt in train_lines:
         train_list.append(tt.split("\n")[0])
     for tt in test_lines:
         test_list.append(tt.split("\n")[0])
 
+    train_list_basenames = [os.path.basename(x.strip()) for x in train_list]
+    test_list_basenames = [os.path.basename(x.strip()) for x in test_list]
+
     counter = 0
     frames_count = 0
+    non_existent_files = 0
     for r, ds, fs in os.walk(audio_path):
-
         for f in tqdm(fs):
-            counter += 1
             # Activate when testing the model
             if test_config and f not in test_list:
                 continue
-
             if f.endswith("wav"):
                 key          = f.replace("wav", "npy")
                 subject_id   = "_".join(key.split("_")[:-1])
                 blendshapes_path = os.path.join(vertices_path, f.replace("wav", "npz"))
-            
+
                 if not os.path.exists(blendshapes_path):
+                    non_existent_files += 1
+                    print("File does not exist:", blendshapes_path)
                     continue
                 else:
                     # Load blendshapes (FLAME parameters)
                     flame_param = np.load(blendshapes_path, allow_pickle=True)
 
                     # Discard sequences with more than 600 frames (too large for training)
-                    if 'pose' in flame_param and (flame_param["exp"].shape[0] > 350 or flame_param["exp"].shape[0] < 8):
+                    if 'pose' in flame_param and (flame_param["exp"].shape[0] > 600 or flame_param["exp"].shape[0] < 8):
                         continue
-                    elif 'pose_params' in flame_param and (flame_param["expression_params"].shape[0] > 350 or flame_param["expression_params"].shape[0] < 8):
+                    elif 'pose_params' in flame_param and (flame_param["expression_params"].shape[0] > 600 or flame_param["expression_params"].shape[0] < 8):
                         continue
-                    elif 'gpose' in flame_param and (flame_param["exp"].shape[0] > 350 or flame_param["exp"].shape[0] < 8):
+                    elif 'gpose' in flame_param and (flame_param["exp"].shape[0] > 600 or flame_param["exp"].shape[0] < 8):
                         continue
                     else:
-                        if 'pose' in flame_param:
-                            expr   = flame_param["exp"].reshape(-1,50)
-                            jaw    = flame_param["pose"][:,3:6].reshape(-1,3)
-                            gpose  = flame_param["pose"][:,0:3].reshape(-1,3)
-                            gpose  = gpose - gpose.mean(axis=0, keepdims=True)
-                            # Apply Savitzky-Golay filter along the time axis (axis=0)
-                        elif 'pose_params' in flame_param:
-                            expr   = flame_param['expression_params'].reshape(-1, 50)
-                            jaw    = flame_param["jaw_params"].reshape(-1, 3)
-                            gpose  = flame_param["pose_params"].reshape(-1, 3)
-                            gpose  = gpose - gpose.mean(axis=0, keepdims=True)
+                        counter += 1
+                        # Robust loading of FLAME parameters
+                        npz_files = set(flame_param.files)
+
+                        # Expression
+                        if "exp" in npz_files:
+                            expr = flame_param["exp"]
+                        elif "expression_params" in npz_files:
+                            expr = flame_param["expression_params"]
                         else:
-                            expr    = flame_param["exp"].reshape((flame_param["exp"].shape[0], -1))
-                            gpose   = flame_param["gpose"].reshape((flame_param["gpose"].shape[0], -1))
-                            jaw     = flame_param["jaw"].reshape((flame_param["jaw"].shape[0], -1))
+                            continue
+
+                        # Pose / gpose
+                        pose = None
+                        if "pose" in npz_files:
+                            pose = flame_param["pose"]
+                        elif "pose_params" in npz_files:
+                            pose = flame_param["pose_params"]
+                        elif "gpose" in npz_files:
+                            pose = flame_param["gpose"]
+
+                        # Jaw
+                        jaw = None
+                        if "jaw" in npz_files:
+                            jaw = flame_param["jaw"]
+                        elif "jaw_params" in npz_files:
+                            jaw = flame_param["jaw_params"]
+
+                        # Eyelids
+                        eyelids = None
+                        if "eyelids" in npz_files:
+                            eyelids = flame_param["eyelids"]
+
+                        # Normalize shapes
+                        expr = expr.reshape(expr.shape[0], -1)
+
+                        if pose is None and jaw is None:
+                            continue
+
+                        if pose is not None:
+                            pose = pose.reshape(pose.shape[0], -1)
+
+                            if pose.shape[1] >= 6:
+                                gpose = pose[:, 0:3]
+                                jaw_from_pose = pose[:, 3:6]
+                                jaw = jaw_from_pose if jaw is None else jaw.reshape(jaw.shape[0], -1)
+                            elif pose.shape[1] == 3:
+                                gpose = pose
+                                if jaw is None:
+                                    continue
+                                jaw = jaw.reshape(jaw.shape[0], -1)
+                            else:
+                                continue
+                        else:
+                            # gpose missing, cannot proceed
+                            continue
+
+                        gpose = gpose - gpose.mean(axis=0, keepdims=True)
 
                         # Apply Savitzky-Golay filter along the time axis for gpose (removes tracker's flickering) (axis=0)
-                        gpose = savgol_filter(gpose, window_length=7, polyorder=2, axis=0)
-
+                        #gpose = savgol_filter(gpose, window_length=7, polyorder=2, axis=0)
                         
                         # Compute vertices for supervision in vq training
                         exp_tensor    = torch.Tensor(expr)
                         jaw_tensor    = torch.Tensor(jaw) 
                         gpose_tensor  = torch.Tensor(gpose)
+
+                        #if eyelids is not None:
+                        #    eyelids_tensor = torch.Tensor(eyelids).reshape(eyelids.shape[0], -1)
+                        #else:   
                         eyelids_tensor = torch.ones((exp_tensor.shape[0], 2)) # Not tracked in all datasets, so we use a placeholder
-
-                        s = torch.empty(1).uniform_(3.0, 4.0)
-                        gpose_tensor *= s
-
                         
                         concat_blendshapes = np.concatenate((exp_tensor.numpy(), gpose_tensor.numpy(), jaw_tensor.numpy(), eyelids_tensor.numpy()), axis=1)
 
@@ -183,19 +233,29 @@ def read_data(args, test_config=False):
                             input_audio_features = np.squeeze(processor(speech_array, sampling_rate=16000).input_values)
                             data[key]["audio"]   = input_audio_features
 
-            if counter > 1000:
-                break
-                   
+            #if counter > 100:
+            #    break
+    print("Total sequences:", counter, " Non-existent files:", non_existent_files)
     subjects_dict = {}
     subjects_dict["train"] = [i for i in args.train_subjects.split(" ")]
     subjects_dict["val"]   = [i for i in args.val_subjects.split(" ")]
     subjects_dict["test"]  = [i for i in args.test_subjects.split(" ")]
+
+    # Debug: show filename match counts
+    data_wavs = {k.replace("npy", "wav") for k in data.keys()}
+    train_matches_raw = len([w for w in data_wavs if w in train_list])
+    test_matches_raw = len([w for w in data_wavs if w in test_list])
+    train_matches_base = len([w for w in data_wavs if w in train_list_basenames])
+    test_matches_base = len([w for w in data_wavs if w in test_list_basenames])
+    print("Train matches (raw):", train_matches_raw, "Test matches (raw):", test_matches_raw)
+    print("Train matches (basename):", train_matches_base, "Test matches (basename):", test_matches_base)
 
     # train vq and pred
     train_cnt = 0
     for k, v in data.items():
         k_wav = k.replace("npy", "wav")
         if k_wav in train_list:
+            #print(train_cnt,len(train_list))
             if train_cnt<int(len(train_list)*0.9):
             #if train_cnt < int(counter* 0.7):
                 train_data.append(v)

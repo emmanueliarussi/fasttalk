@@ -1,6 +1,6 @@
 DATA:
-  dataset: joint_data
-  data_root: /mnt/Datasets/joint_data
+  dataset: TalkingHead-1KH
+  data_root: /mnt/Datasets/TalkingHead-1KH
   wav_path: wav
   vertices_path: npz
   template_file: flame_model/assets/FLAME_with_eye.pt
@@ -42,7 +42,7 @@ PREDICTOR:
   blendshapes_dim: 58
   device: cuda
   period: 25
-  vqvae_pretrained_path: /mnt/fasttalk/logs/joint_data/joint_data_s1_moods/model_30/model.pth.tar 
+  vqvae_pretrained_path: /mnt/fasttalk/logs/talkinghead/talkinghead-s1/model_200/model.pth.tar
   wav2vec2model_path: utter-project/mHuBERT-147 
   teacher_forcing: True
   num_layers: 4

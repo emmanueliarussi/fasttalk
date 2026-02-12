@@ -128,8 +128,8 @@ def read_data(args, test_config=False):
                     flame_param = np.load(blendshapes_path, allow_pickle=True)
 
                     # Discard sequences with more than 600 frames (too large for training)
-                    #if 'pose' in flame_param and (flame_param["exp"].shape[0] > 350 or flame_param["exp"].shape[0] < 8):
-                    #    continue
+                    if 'pose' in flame_param and (flame_param["exp"].shape[0] > 600 or flame_param["exp"].shape[0] < 8):
+                        continue
                     #elif 'pose_params' in flame_param and (flame_param["expression_params"].shape[0] > 350 or flame_param["expression_params"].shape[0] #< 8):
                     #    continue
                     #elif 'gpose' in flame_param and (flame_param["exp"].shape[0] > 350 or flame_param["exp"].shape[0] < 8):
@@ -172,7 +172,7 @@ def read_data(args, test_config=False):
                             input_audio_features = np.squeeze(processor(speech_array, sampling_rate=16000).input_values)
                             data[key]["audio"]   = input_audio_features
                     except Exception as e:
-                        print("Error loading data for {}. Skipping.".format(blendshapes_path))
+                        #print("Error loading data for {}. Skipping.".format(blendshapes_path))
                         continue
 
             #if counter > 1000:

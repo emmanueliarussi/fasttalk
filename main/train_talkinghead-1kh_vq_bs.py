@@ -105,7 +105,7 @@ def main_worker(gpu, ngpus_per_node, args):
         scheduler = None
 
     # ####################### Data Loader ####################### #
-    from dataset.data_loader_fasttalk import get_dataloaders
+    from dataset.data_loader_joint_data_batched import get_dataloaders
     dataset = get_dataloaders(cfg)
     train_loader = dataset['train']
     if cfg.evaluate:
