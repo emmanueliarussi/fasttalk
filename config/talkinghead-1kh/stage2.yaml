@@ -37,6 +37,7 @@ VQuantizer:
 
 PREDICTOR:
   feature_dim: 1024
+  style_dim: 256
   blendshapes_dim: 58
   device: cuda
   period: 25
@@ -46,8 +47,6 @@ PREDICTOR:
   teacher_forcing: True
   num_layers: 4 # 6
   n_head: 4 # 4
-  fixed_style: False
-  fixed_style_path: /mnt/fasttalk/demo/styles/style_2.npz
 
 TRAIN:
   use_sgd: False

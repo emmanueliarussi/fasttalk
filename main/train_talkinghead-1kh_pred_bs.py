@@ -165,7 +165,7 @@ def main_worker(gpu, ngpus_per_node, args):
         scheduler = None
 
     # =========== Load checkpoint ===========
-    checkpoint_path = "/mnt/fasttalk/logs/talkinghead/talkinghead-s2-ft-stylelayers/model_10/model.pth.tar" #"/mnt/fasttalk/checkpoints_styled_300ep/model_s2.pth.tar"  
+    checkpoint_path = "/mnt/fasttalk/checkpoints_styled_300ep/model_s2_340.pth.tar" # "/mnt/fasttalk/logs/talkinghead/talkinghead-s2-ft-stylelayers/model_10/model.pth.tar" #"/mnt/fasttalk/checkpoints_styled_300ep/model_s2.pth.tar"  
     print("=> Loading checkpoint '{}'".format(checkpoint_path))
     checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage.cpu())
     load_state_dict(model, checkpoint['state_dict'], strict=False)

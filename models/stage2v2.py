@@ -218,10 +218,6 @@ class CodeTalker(BaseModel):
         super(CodeTalker, self).__init__()
         self.args    = args
         self.dataset = args.dataset
-        self.fixed_style = getattr(args, "fixed_style", False)
-        self.fixed_style_path = getattr(args, "fixed_style_path", None)
-        self.register_buffer("fixed_style_seq", torch.empty(0, 58), persistent=True)
-        self._cached_fixed_style_vec = None
         self.audio_encoder = Wav2Vec2Model.from_pretrained(args.wav2vec2model_path)
         print("Loading pretrained: {}".format(args.wav2vec2model_path))
 
@@ -271,35 +267,6 @@ class CodeTalker(BaseModel):
                                                         batch_first=True,
                                                     )
         self.style_audio_gate = nn.Parameter(torch.zeros(1))
-        if self.fixed_style:
-            self.fixed_style_token = nn.Parameter(torch.zeros(1, style_dim))
-            nn.init.zeros_(self.fixed_style_token)
-
-        if self.fixed_style_path and self.fixed_style_seq.numel() == 0:
-            loaded = torch.load(self.fixed_style_path, map_location="cpu")
-            if isinstance(loaded, dict) and "expression_params" in loaded:
-                expr = loaded["expression_params"].reshape(-1, 50)
-                gpose = loaded.get("pose_params", loaded.get("gpose", None))
-                if gpose is None:
-                    raise ValueError("fixed_style_path missing pose parameters.")
-                gpose = gpose.reshape(-1, 3)
-                jaw = loaded.get("jaw_params", loaded.get("jaw", None))
-                if jaw is None:
-                    raise ValueError("fixed_style_path missing jaw parameters.")
-                jaw = jaw.reshape(-1, 3)
-                eyelids = torch.ones((expr.shape[0], 2), dtype=torch.float32)
-                expr = torch.as_tensor(expr, dtype=torch.float32)
-                gpose = torch.as_tensor(gpose, dtype=torch.float32)
-                jaw = torch.as_tensor(jaw, dtype=torch.float32)
-                self.fixed_style_seq = torch.cat([expr, gpose, jaw, eyelids], dim=-1)
-            else:
-                seq = torch.as_tensor(loaded, dtype=torch.float32)
-                if seq.dim() == 2:
-                    self.fixed_style_seq = seq
-                elif seq.dim() == 3:
-                    self.fixed_style_seq = seq[0]
-                else:
-                    raise ValueError("fixed_style_path must be [T,58] or [1,T,58]")
 
         # motion decoder
         # self.feat_map = nn.Linear(args.feature_dim, 512, bias=False)
@@ -337,23 +304,6 @@ class CodeTalker(BaseModel):
         style_vec = feats.sum(1) / (mask.sum(1, keepdim=True) + 1e-6)  # [B, 1024]
 
         return F.normalize(style_vec, dim=-1)
-
-
-    def _get_fixed_style_vec(self, device, dtype):
-        if self.fixed_style_seq.numel() == 0:
-            return None
-        if self._cached_fixed_style_vec is not None and self._cached_fixed_style_vec.device == device and self._cached_fixed_style_vec.dtype == dtype:
-            return self._cached_fixed_style_vec
-        with torch.no_grad():
-            style_seq = self.fixed_style_seq.to(device=device, dtype=dtype).unsqueeze(0)
-            style_mask = torch.ones(style_seq.shape[:2], dtype=torch.bool, device=device)
-            feat_q_gt, _, _ = self.autoencoder.get_quant(style_seq, style_mask)
-            style_feats = self.style_proj(feat_q_gt)
-            style_feats = self.pos_enc(style_feats)
-            style_feats = self.style_frame_encoder(style_feats)
-            style_vec = F.normalize(style_feats.mean(dim=1), dim=-1)
-        self._cached_fixed_style_vec = style_vec.detach()
-        return style_vec
 
 
     def _style_seq_from_target(self, target_style: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -472,20 +422,14 @@ class CodeTalker(BaseModel):
         # ── Style ──────────────────────────────────────────────────────
         feat_q_gt, _, encoded = self.autoencoder.get_quant(padded_blendshapes, blendshapes_mask) # Autoencoder embedded features
 
-        if self.fixed_style:
-            style_vec = self._get_fixed_style_vec(padded_blendshapes.device, padded_blendshapes.dtype)
-            if style_vec is None:
-                style_vec = self.fixed_style_token.expand(B, -1)
-            loss_style = torch.zeros((), device=padded_blendshapes.device)
-        else:
-            # --- build two cropped views ------------------------------------------------
-            (view1, m1), (view2, m2) = self._make_two_views(feat_q_gt.detach(), blendshapes_mask)
-            style_a = self._style_view(view1, m1)          # [B, D]
-            style_b = self._style_view(view2, m2)          # [B, D]
+        # --- build two cropped views ------------------------------------------------
+        (view1, m1), (view2, m2) = self._make_two_views(feat_q_gt.detach(), blendshapes_mask)
+        style_a = self._style_view(view1, m1)          # [B, D]
+        style_b = self._style_view(view2, m2)          # [B, D]
 
-            # pick one view (random per-sample) for conditioning
-            pick_a = torch.rand(style_a.shape[0], 1, device=style_a.device) < 0.5
-            style_vec = torch.where(pick_a, style_a, style_b)
+        # pick one view (random per-sample) for conditioning
+        pick_a = torch.rand(style_a.shape[0], 1, device=style_a.device) < 0.5
+        style_vec = torch.where(pick_a, style_a, style_b)
        
         # ========== AUTOREGRESSIVE ==========
         # Create one frame of 0s and shift right the blendshapes by one frame, insert the 0s
@@ -536,8 +480,7 @@ class CodeTalker(BaseModel):
         loss_blendshapes = criterion(blendshapes_out, padded_blendshapes)  # L2 loss
       
         # --- add self-supervised style compactness ---------------------------------
-        if not self.fixed_style:
-            loss_style = self.nt_xent_unsup(style_a, style_b)
+        loss_style = self.nt_xent_unsup(style_a, style_b)
 
         return loss_blendshapes + loss_reg + 0.001 * loss_style,  [loss_blendshapes, loss_reg, loss_style, loss_reg]#, blendshapes_out #+  0.01 * nt_xent_loss,
     
@@ -553,11 +496,7 @@ class CodeTalker(BaseModel):
 
         #  Build style_vec once per batch ───────────────────────────────
         style_seq = None
-        if self.fixed_style:
-            style_vec = self._get_fixed_style_vec(hidden_states.device, hidden_states.dtype)
-            if style_vec is None:
-                style_vec = self.fixed_style_token.expand(hidden_states.shape[0], -1)
-        elif target_style is not None:
+        if target_style is not None:
             style_seq = self._style_seq_from_target(target_style, frame_num)
             style_vec = style_seq.mean(dim=1)
         else:
@@ -619,11 +558,7 @@ class CodeTalker(BaseModel):
 
         #  Build style_vec once per batch ───────────────────────────────
         style_seq = None
-        if self.fixed_style:
-            style_vec = self._get_fixed_style_vec(hidden_states.device, hidden_states.dtype)
-            if style_vec is None:
-                style_vec = self.fixed_style_token.expand(hidden_states.shape[0], -1)
-        elif target_style is not None:
+        if target_style is not None:
             style_seq = self._style_seq_from_target(target_style, frame_num)
             style_vec = style_seq.mean(dim=1)
         else:
