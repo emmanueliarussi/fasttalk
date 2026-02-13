@@ -306,6 +306,52 @@ class CodeTalker(BaseModel):
         return F.normalize(style_vec, dim=-1)
 
 
+    def _smooth_style_seq(self, style_seq: torch.Tensor) -> torch.Tensor:
+        smooth_k = getattr(self.args, "style_smooth_kernel", 0)
+        if not smooth_k or smooth_k <= 1:
+            return style_seq
+        pad = smooth_k // 2
+        return F.avg_pool1d(
+            style_seq.transpose(1, 2),
+            kernel_size=smooth_k,
+            stride=1,
+            padding=pad,
+        ).transpose(1, 2)
+
+
+    def _style_seq_view(self, blend: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        blend: [B, T, 512]
+        mask : [B, T]
+        returns: [B, T, 1024]
+        """
+        feats = self.style_proj(blend)  # [B, T, 1024]
+        feats = self.pos_enc(feats)
+        key_padding_mask = ~mask
+        feats = self.style_frame_encoder(feats, src_key_padding_mask=key_padding_mask)
+        feats = self._smooth_style_seq(feats)
+        return F.normalize(feats, dim=-1)
+
+
+    def _pool_style_seq(self, style_seq: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        feats = style_seq * mask.unsqueeze(-1)
+        style_vec = feats.sum(1) / (mask.sum(1, keepdim=True) + 1e-6)
+        return F.normalize(style_vec, dim=-1)
+
+
+    def _temporal_shuffle(self, style_seq: torch.Tensor, mask: torch.Tensor, max_shift: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if max_shift <= 0:
+            return style_seq, mask
+        B, T, _ = style_seq.shape
+        shifts = torch.randint(-max_shift, max_shift + 1, (B,), device=style_seq.device)
+        base = torch.arange(T, device=style_seq.device).unsqueeze(0)
+        idx = (base + shifts.unsqueeze(1)) % T
+        idx_seq = idx.unsqueeze(-1).expand(B, T, style_seq.shape[-1])
+        shuffled_seq = style_seq.gather(1, idx_seq)
+        shuffled_mask = mask.gather(1, idx)
+        return shuffled_seq, shuffled_mask
+
+
     def _style_seq_from_target(self, target_style: torch.Tensor, target_len: int) -> torch.Tensor:
         """
         target_style: [B, T, 58]
@@ -323,6 +369,7 @@ class CodeTalker(BaseModel):
                 mode="linear",
                 align_corners=False,
             ).transpose(1, 2)
+        style_feats = self._smooth_style_seq(style_feats)
         return F.normalize(style_feats, dim=-1)
 
 
@@ -422,14 +469,19 @@ class CodeTalker(BaseModel):
         # ── Style ──────────────────────────────────────────────────────
         feat_q_gt, _, encoded = self.autoencoder.get_quant(padded_blendshapes, blendshapes_mask) # Autoencoder embedded features
 
-        # --- build two cropped views ------------------------------------------------
+        # --- build two cropped views (temporal) ------------------------------------
         (view1, m1), (view2, m2) = self._make_two_views(feat_q_gt.detach(), blendshapes_mask)
-        style_a = self._style_view(view1, m1)          # [B, D]
-        style_b = self._style_view(view2, m2)          # [B, D]
+        style_seq_a = self._style_seq_view(view1, m1)  # [B, T, D]
+        style_seq_b = self._style_seq_view(view2, m2)  # [B, T, D]
 
         # pick one view (random per-sample) for conditioning
-        pick_a = torch.rand(style_a.shape[0], 1, device=style_a.device) < 0.5
-        style_vec = torch.where(pick_a, style_a, style_b)
+        pick_a = torch.rand(style_seq_a.shape[0], 1, 1, device=style_seq_a.device) < 0.5
+        style_seq = torch.where(pick_a, style_seq_a, style_seq_b)
+        style_mask = torch.where(pick_a.squeeze(-1), m1, m2)
+
+        if self.training and getattr(self.args, "style_temporal_shuffle", False):
+            max_shift = int(getattr(self.args, "style_temporal_shuffle_max", 0))
+            style_seq, style_mask = self._temporal_shuffle(style_seq, style_mask, max_shift)
        
         # ========== AUTOREGRESSIVE ==========
         # Create one frame of 0s and shift right the blendshapes by one frame, insert the 0s
@@ -447,16 +499,9 @@ class CodeTalker(BaseModel):
      
         # ========== DECODER FOR AUTOREGRESSIVE PREDICTION ==========
         # During forward / predict:
-        style_for_dec = style_vec
-        if getattr(self.args, "use_temporal_style", False):
-            alpha = getattr(self.args, "temporal_style_alpha", 1.0)
-            style_drop_prob = getattr(self.args, "style_dropout_prob", 0.0)
-            if self.training and style_drop_prob > 0 and torch.rand((), device=style_vec.device) < style_drop_prob:
-                style_for_dec = style_vec
-            else:
-                style_seq = self._style_seq_from_target(padded_blendshapes, emb_blendshapes_tgt.shape[1])
-                style_seq = self._fuse_style_with_audio(style_seq, hidden_states, memory_key_padding_mask)
-                style_for_dec = (1.0 - alpha) * style_vec.unsqueeze(1) + alpha * style_seq
+        if getattr(self.args, "style_use_audio_fusion", False):
+            style_seq = self._fuse_style_with_audio(style_seq, hidden_states, memory_key_padding_mask)
+        style_for_dec = style_seq
         
         feat_out = self.transformer_decoder(
                                                 tgt=emb_blendshapes_tgt,
@@ -480,6 +525,8 @@ class CodeTalker(BaseModel):
         loss_blendshapes = criterion(blendshapes_out, padded_blendshapes)  # L2 loss
       
         # --- add self-supervised style compactness ---------------------------------
+        style_a = self._pool_style_seq(style_seq_a, m1)
+        style_b = self._pool_style_seq(style_seq_b, m2)
         loss_style = self.nt_xent_unsup(style_a, style_b)
 
         return loss_blendshapes + loss_reg + 0.001 * loss_style,  [loss_blendshapes, loss_reg, loss_style, loss_reg]#, blendshapes_out #+  0.01 * nt_xent_loss,
@@ -495,15 +542,17 @@ class CodeTalker(BaseModel):
         frame_num = hidden_states.shape[1]//2
 
         #  Build style_vec once per batch ───────────────────────────────
-        style_seq = None
         if target_style is not None:
             style_seq = self._style_seq_from_target(target_style, frame_num)
-            style_vec = style_seq.mean(dim=1)
+            style_mask = torch.ones(style_seq.shape[:2], dtype=torch.bool, device=style_seq.device)
         else:
-            # fallback: a learnable "neutral" token (could also be zeros)
-            style_vec = torch.zeros(1, self.args.feature_dim, device=self.device, dtype=hidden_states.dtype)
+            style_seq = torch.zeros(
+                hidden_states.shape[0], frame_num, self.args.feature_dim,
+                device=self.device, dtype=hidden_states.dtype,
+            )
+            style_mask = torch.ones(style_seq.shape[:2], dtype=torch.bool, device=style_seq.device)
 
-        if style_seq is not None:
+        if getattr(self.args, "style_use_audio_fusion", False):
             style_seq = self._fuse_style_with_audio(style_seq, hidden_states, None)
 
         # autoregressive facial motion prediction
@@ -517,8 +566,7 @@ class CodeTalker(BaseModel):
             tgt_mask    = self.biased_mask[:, :blendshapes_input.shape[1], :blendshapes_input.shape[1]].clone().detach().to(device=self.device).squeeze(0)
             memory_mask = enc_dec_mask(self.device, self.dataset, blendshapes_input.shape[1], hidden_states.shape[1])
 
-            alpha = getattr(self.args, "temporal_style_alpha", 1.0)
-            style_for_dec = style_vec if style_seq is None else (1.0 - alpha) * style_vec.unsqueeze(1) + alpha * style_seq[:, :blendshapes_input.shape[1], :]
+            style_for_dec = style_seq[:, :blendshapes_input.shape[1], :]
             feat_out = self.transformer_decoder(
                                                 tgt=blendshapes_input,
                                                 memory=hidden_states,
@@ -557,15 +605,17 @@ class CodeTalker(BaseModel):
         frame_num = hidden_states.shape[1]//2
 
         #  Build style_vec once per batch ───────────────────────────────
-        style_seq = None
         if target_style is not None:
             style_seq = self._style_seq_from_target(target_style, frame_num)
-            style_vec = style_seq.mean(dim=1)
+            style_mask = torch.ones(style_seq.shape[:2], dtype=torch.bool, device=style_seq.device)
         else:
-            # fallback: a learnable "neutral" token (could also be zeros)
-            style_vec = torch.zeros(1, self.args.feature_dim, device=self.device, dtype=hidden_states.dtype)
+            style_seq = torch.zeros(
+                hidden_states.shape[0], frame_num, self.args.feature_dim,
+                device=self.device, dtype=hidden_states.dtype,
+            )
+            style_mask = torch.ones(style_seq.shape[:2], dtype=torch.bool, device=style_seq.device)
 
-        if style_seq is not None:
+        if getattr(self.args, "style_use_audio_fusion", False):
             style_seq = self._fuse_style_with_audio(style_seq, hidden_states, None)
 
         # autoregressive facial motion prediction
@@ -579,8 +629,7 @@ class CodeTalker(BaseModel):
             tgt_mask    = self.biased_mask[:, :blendshapes_input.shape[1], :blendshapes_input.shape[1]].clone().detach().to(device=self.device).squeeze(0)
             memory_mask = enc_dec_mask(self.device, self.dataset, blendshapes_input.shape[1], hidden_states.shape[1])
 
-            alpha = getattr(self.args, "temporal_style_alpha", 1.0)
-            style_for_dec = style_vec if style_seq is None else (1.0 - alpha) * style_vec.unsqueeze(1) + alpha * style_seq[:, :blendshapes_input.shape[1], :]
+            style_for_dec = style_seq[:, :blendshapes_input.shape[1], :]
             feat_out = self.transformer_decoder(
                                                 tgt=blendshapes_input,
                                                 memory=hidden_states,

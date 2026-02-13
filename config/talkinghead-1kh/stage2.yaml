@@ -1,6 +1,6 @@
 DATA:
   dataset: TalkingHead-1KH
-  data_root: /mnt/Datasets/ARTalk_data # /mnt/GSAMegaRepo/joint_data # /mnt/Datasets/expressive_ft
+  data_root: /mnt/Datasets/ARTalk_data # /mnt/GSAMegaRepo/joint_data  # /mnt/Datasets/expressive_ft
   wav_path: wav
   vertices_path: npz
   template_file: flame_model/assets/FLAME_with_eye.pt
@@ -41,7 +41,10 @@ PREDICTOR:
   blendshapes_dim: 58
   device: cuda
   period: 25
-  style_dropout_prob: 0.2
+  style_use_audio_fusion: False
+  style_smooth_kernel: 5
+  style_temporal_shuffle: True
+  style_temporal_shuffle_max: 25
   vqvae_pretrained_path: /mnt/fasttalk/checkpoints_styled_300ep/model_s1.pth.tar #/mnt/fasttalk/logs/talkinghead/talkinghead-s1/model_200/model.pth.tar
   wav2vec2model_path: utter-project/mHuBERT-147 # facebook/wav2vec2-large-xlsr-53  
   teacher_forcing: True
@@ -74,7 +77,7 @@ TRAIN:
   print_freq: 10
   save_freq: 1
   save_path:
-  weight:
+  weight: /mnt/fasttalk/logs/talkinghead/talkinghead-s2/model_40_joint_data_styled/model.pth.tar #/mnt/fasttalk/checkpoints_styled_300ep/model_s2_340.pth.tar
   resume:
   evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
   eval_freq: 5
@@ -83,8 +86,7 @@ TRAIN:
   l2sp_exclude: []
   kd_weight: 0.0
   trainable_modules: ["style_frame_encoder", "style_proj", "style_audio_attn", "style_audio_gate", "transformer_decoder.layers.3"]
-  use_temporal_style: True
-  temporal_style_alpha: 0.5
+  #trainable_modules: ["audio_encoder", "audio_feature_map", "style_audio_attn", "style_audio_gate"] # To finetune audio-related layers only
   style_audio_causal: True
 
 Distributed:
