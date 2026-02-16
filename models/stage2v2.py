@@ -529,7 +529,9 @@ class CodeTalker(BaseModel):
         style_b = self._pool_style_seq(style_seq_b, m2)
         loss_style = self.nt_xent_unsup(style_a, style_b)
 
-        return loss_blendshapes + loss_reg + 0.001 * loss_style,  [loss_blendshapes, loss_reg, loss_style, loss_reg]#, blendshapes_out #+  0.01 * nt_xent_loss,
+        total_loss = loss_blendshapes + loss_reg + 0.001 * loss_style
+
+        return total_loss,  [loss_blendshapes, loss_reg, loss_style, loss_reg]#, blendshapes_out #+  0.01 * nt_xent_loss,
     
 
     def predict(self, audio, target_style=None):

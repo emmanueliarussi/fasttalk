@@ -1,6 +1,6 @@
 DATA:
   dataset: TalkingHead-1KH
-  data_root: /mnt/Datasets/ARTalk_data # /mnt/GSAMegaRepo/joint_data  # /mnt/Datasets/expressive_ft
+  data_root: /mnt/GSAMegaRepo/joint_data # /mnt/Datasets/ARTalk_data #   # /mnt/Datasets/expressive_ft
   wav_path: wav
   vertices_path: npz
   template_file: flame_model/assets/FLAME_with_eye.pt
@@ -58,7 +58,7 @@ TRAIN:
   workers: 10  # data load\er workers
   batch_size: 10 # 1  # batch size for training
   batch_size_val: 1  # batch size for validation during training, memory and speed tradeoff
-  base_lr:  1.0e-6 #0.0001 # USE 0.00001 FOR FULL DATASET TRAINING - 0.000001 FOR FINETUNNING
+  base_lr: 1.0e-6 #0.0001 # USE 0.00001 FOR FULL DATASET TRAINING - 0.000001 FOR FINETUNNING
   StepLR: False
   warmup_steps: 1
   adaptive_lr: False
@@ -85,7 +85,7 @@ TRAIN:
   l2sp_weight: 1.0e-4
   l2sp_exclude: []
   kd_weight: 0.0
-  trainable_modules: ["style_frame_encoder", "style_proj", "style_audio_attn", "style_audio_gate", "transformer_decoder.layers.3"]
+  trainable_modules: ["style_frame_encoder", "style_proj", "style_audio_attn", "style_audio_gate", "transformer_decoder.layers.2", "transformer_decoder.layers.3"]
   #trainable_modules: ["audio_encoder", "audio_feature_map", "style_audio_attn", "style_audio_gate"] # To finetune audio-related layers only
   style_audio_causal: True
 
