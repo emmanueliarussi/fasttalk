@@ -117,6 +117,8 @@ def read_data(args, test_config=False):
     counter = 0
     frames_count = 0
     non_existent_files = 0
+    max_seq_len = getattr(args, "max_seq_len", 600)
+    min_seq_len = 8
     for r, ds, fs in os.walk(audio_path):
         for f in tqdm(fs):
             # Activate when testing the model
@@ -135,15 +137,14 @@ def read_data(args, test_config=False):
                     # Load blendshapes (FLAME parameters)
                     flame_param = np.load(blendshapes_path, allow_pickle=True)
 
-                    # Discard sequences with more than 600 frames (too large for training)
-                    if 'pose' in flame_param and (flame_param["exp"].shape[0] > 600 or flame_param["exp"].shape[0] < 8):
+                    # Discard only sequences that are too short
+                    if 'pose' in flame_param and flame_param["exp"].shape[0] < min_seq_len:
                         continue
-                    elif 'pose_params' in flame_param and (flame_param["expression_params"].shape[0] > 600 or flame_param["expression_params"].shape[0] < 8):
+                    elif 'pose_params' in flame_param and flame_param["expression_params"].shape[0] < min_seq_len:
                         continue
-                    elif 'gpose' in flame_param and (flame_param["exp"].shape[0] > 600 or flame_param["exp"].shape[0] < 8):
+                    elif 'gpose' in flame_param and flame_param["exp"].shape[0] < min_seq_len:
                         continue
                     else:
-                        counter += 1
                         # Robust loading of FLAME parameters
                         npz_files = set(flame_param.files)
 
@@ -217,11 +218,7 @@ def read_data(args, test_config=False):
                         
                         concat_blendshapes = np.concatenate((exp_tensor.numpy(), gpose_tensor.numpy(), jaw_tensor.numpy(), eyelids_tensor.numpy()), axis=1)
 
-                        data[key]["blendshapes"] = concat_blendshapes
-
-                        frames_count += concat_blendshapes.shape[0]
-
-                        # Load audio if required
+                        input_audio_features = None
                         if args.read_audio:
                             wav_path = os.path.join(r, f)
                             speech_array, sampling_rate = librosa.load(wav_path, sr=16000)
@@ -231,7 +228,27 @@ def read_data(args, test_config=False):
                             speech_array = librosa.util.fix_length(speech_array, size=expected_len)
 
                             input_audio_features = np.squeeze(processor(speech_array, sampling_rate=16000).input_values)
-                            data[key]["audio"]   = input_audio_features
+
+                        total_frames = concat_blendshapes.shape[0]
+                        chunk_idx = 0
+                        for start in range(0, total_frames, max_seq_len):
+                            end = min(total_frames, start + max_seq_len)
+                            if (end - start) < min_seq_len:
+                                continue
+
+                            chunk_key = f"{key}_chunk{chunk_idx:03d}"
+                            chunk_blendshapes = concat_blendshapes[start:end]
+                            data[chunk_key]["blendshapes"] = chunk_blendshapes
+                            data[chunk_key]["source_wav"] = f
+
+                            if input_audio_features is not None:
+                                audio_start = start * 640
+                                audio_end = end * 640
+                                data[chunk_key]["audio"] = input_audio_features[audio_start:audio_end]
+
+                            frames_count += chunk_blendshapes.shape[0]
+                            counter += 1
+                            chunk_idx += 1
 
             #if counter > 100:
             #    break
@@ -242,7 +259,7 @@ def read_data(args, test_config=False):
     subjects_dict["test"]  = [i for i in args.test_subjects.split(" ")]
 
     # Debug: show filename match counts
-    data_wavs = {k.replace("npy", "wav") for k in data.keys()}
+    data_wavs = {v.get("source_wav", k.replace("npy", "wav")) for k, v in data.items()}
     train_matches_raw = len([w for w in data_wavs if w in train_list])
     test_matches_raw = len([w for w in data_wavs if w in test_list])
     train_matches_base = len([w for w in data_wavs if w in train_list_basenames])
@@ -251,19 +268,30 @@ def read_data(args, test_config=False):
     print("Train matches (basename):", train_matches_base, "Test matches (basename):", test_matches_base)
 
     # train vq and pred
-    train_cnt = 0
+    train_items = []
+    test_items = []
     for k, v in data.items():
-        k_wav = k.replace("npy", "wav")
+        k_wav = v.get("source_wav", k.replace("npy", "wav"))
         if k_wav in train_list:
-            #print(train_cnt,len(train_list))
-            if train_cnt<int(len(train_list)*0.9):
-            #if train_cnt < int(counter* 0.7):
-                train_data.append(v)
-            else:
-                valid_data.append(v)
-            train_cnt+=1
+            train_items.append((k, v))
         elif k_wav in test_list:
-            test_data.append(v)
+            test_items.append((k, v))
+
+    # Keep split deterministic
+    train_items.sort(key=lambda kv: kv[0])
+    test_items.sort(key=lambda kv: kv[0])
+
+    test_data = [v for _, v in test_items]
+
+    # Size validation set to be on the order of the test set
+    if len(test_data) > 0:
+        val_target = min(len(train_items), len(test_data))
+    else:
+        val_target = int(len(train_items) * 0.1)
+
+    split_idx = max(0, len(train_items) - val_target)
+    train_data = [v for _, v in train_items[:split_idx]]
+    valid_data = [v for _, v in train_items[split_idx:]]
 
     print('Loaded data: Train-{}, Val-{}, Test-{}'.format(len(train_data), len(valid_data), len(test_data)))
     print('Total hours of data: {:.2f}'.format(frames_count / 25 / 60 / 60))
