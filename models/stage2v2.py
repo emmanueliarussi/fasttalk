@@ -329,7 +329,8 @@ class CodeTalker(BaseModel):
         feats = self.pos_enc(feats)
         key_padding_mask = ~mask
         feats = self.style_frame_encoder(feats, src_key_padding_mask=key_padding_mask)
-        feats = self._smooth_style_seq(feats)
+        if self.training and getattr(self.args, "style_smooth_train", False):
+            feats = self._smooth_style_seq(feats)
         return F.normalize(feats, dim=-1)
 
 
@@ -369,7 +370,7 @@ class CodeTalker(BaseModel):
                 mode="linear",
                 align_corners=False,
             ).transpose(1, 2)
-        style_feats = self._smooth_style_seq(style_feats)
+        #style_feats = self._smooth_style_seq(style_feats)
         return F.normalize(style_feats, dim=-1)
 
 
@@ -523,15 +524,29 @@ class CodeTalker(BaseModel):
         feat_out_q, _, _ = self.autoencoder.vq(feat_out) # Quantize the embedding
         blendshapes_out  = self.autoencoder.decode(feat_out_q, blendshapes_mask) # Decode the quantized embedding to get the blendshapes outputfeat_q_gt
         loss_blendshapes = criterion(blendshapes_out, padded_blendshapes)  # L2 loss
+
+        delta_weight = getattr(self.args, "blendshape_delta_weight", 0.0)
+        if delta_weight > 0:
+            pred_delta = blendshapes_out[:, 1:] - blendshapes_out[:, :-1]
+            gt_delta = padded_blendshapes[:, 1:] - padded_blendshapes[:, :-1]
+            delta_mask = blendshapes_mask[:, 1:] & blendshapes_mask[:, :-1]
+            if delta_mask.any():
+                diff = (pred_delta - gt_delta) * delta_mask.unsqueeze(-1)
+                denom = delta_mask.sum().clamp(min=1).float() * diff.shape[-1]
+                loss_delta = diff.pow(2).sum() / denom
+            else:
+                loss_delta = torch.zeros((), device=blendshapes_out.device)
+        else:
+            loss_delta = torch.zeros((), device=blendshapes_out.device)
       
         # --- add self-supervised style compactness ---------------------------------
         style_a = self._pool_style_seq(style_seq_a, m1)
         style_b = self._pool_style_seq(style_seq_b, m2)
         loss_style = self.nt_xent_unsup(style_a, style_b)
 
-        total_loss = loss_blendshapes + loss_reg + 0.001 * loss_style
+        total_loss = loss_blendshapes + loss_reg + 0.001 * loss_style + delta_weight * loss_delta
 
-        return total_loss,  [loss_blendshapes, loss_reg, loss_style, loss_reg]#, blendshapes_out #+  0.01 * nt_xent_loss,
+        return total_loss,  [loss_blendshapes, loss_reg, loss_style, loss_reg, loss_delta]#, blendshapes_out #+  0.01 * nt_xent_loss,
     
 
     def predict(self, audio, target_style=None):

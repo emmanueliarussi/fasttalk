@@ -180,7 +180,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # ####################### Train ############################# #
     for epoch in range(cfg.start_epoch, cfg.epochs):
-        loss_train, blendshapes_loss_train, codebook_loss_train, nt_xent_loss_train, reg_loss_train, l2sp_loss_train = train(train_loader, model, loss_fn, optimizer, epoch, cfg, init_params, l2sp_weight)
+        loss_train, blendshapes_loss_train, codebook_loss_train, nt_xent_loss_train, reg_loss_train, delta_loss_train, l2sp_loss_train = train(train_loader, model, loss_fn, optimizer, epoch, cfg, init_params, l2sp_weight)
         epoch_log = epoch + 1
         if cfg.StepLR:
             scheduler.step()
@@ -191,10 +191,11 @@ def main_worker(gpu, ngpus_per_node, args):
                         'codebook_loss_train: {} '
                         'nt_xent_loss_train: {} '
                         'blendshapes_loss_train: {} '
-                        .format(epoch_log, loss_train, codebook_loss_train, nt_xent_loss_train, blendshapes_loss_train)
+                        'delta_loss_train: {} '
+                        .format(epoch_log, loss_train, codebook_loss_train, nt_xent_loss_train, blendshapes_loss_train, delta_loss_train)
                         )
 
-        wandb.log({"loss_train": loss_train, "blendshapes_loss_train": blendshapes_loss_train, "codebook_loss_train": codebook_loss_train, "nt_xent_loss_train": nt_xent_loss_train, "reg_loss_train": reg_loss_train, "l2sp_loss_train": l2sp_loss_train}, epoch_log)
+        wandb.log({"loss_train": loss_train, "blendshapes_loss_train": blendshapes_loss_train, "codebook_loss_train": codebook_loss_train, "nt_xent_loss_train": nt_xent_loss_train, "reg_loss_train": reg_loss_train, "delta_loss_train": delta_loss_train, "l2sp_loss_train": l2sp_loss_train}, epoch_log)
 
         if cfg.evaluate and (epoch_log % cfg.eval_freq == 0):
             loss_val = validate(val_loader, model, loss_fn, cfg)
@@ -218,6 +219,7 @@ def train(train_loader, model, loss_fn, optimizer, epoch, cfg, init_params=None,
     loss_codebook_meter = AverageMeter()
     nt_xent_loss = AverageMeter()
     loss_reg_meter = AverageMeter()
+    loss_delta_meter = AverageMeter()
     l2sp_meter = AverageMeter()
     
 
@@ -261,8 +263,8 @@ def train(train_loader, model, loss_fn, optimizer, epoch, cfg, init_params=None,
         ######################
         batch_time.update(time.time() - end)
         end = time.time()
-        for m, x in zip([loss_meter, loss_blendshapes_meter, loss_codebook_meter, nt_xent_loss, loss_reg_meter],
-            [loss, loss_detail[0],  loss_detail[1], loss_detail[2], loss_detail[3]]):
+        for m, x in zip([loss_meter, loss_blendshapes_meter, loss_codebook_meter, nt_xent_loss, loss_reg_meter, loss_delta_meter],
+            [loss, loss_detail[0],  loss_detail[1], loss_detail[2], loss_detail[3], loss_detail[4]]):
             m.update(x.item(), 1)
         l2sp_meter.update(l2sp_loss.item(), 1)
 
@@ -289,16 +291,18 @@ def train(train_loader, model, loss_fn, optimizer, epoch, cfg, init_params=None,
                         'codebook_loss_meter: {loss_codebook_meter.val:.4f} '
                         'nt_xent_loss: {nt_xent_loss.val:.4f} '
                         'loss_blendshapes_meter: {loss_blendshapes_meter.val:.4f} '
+                        'loss_delta_meter: {loss_delta_meter.val:.4f} '
                         .format(epoch + 1, cfg.epochs, i + 1, len(train_loader),
                                 batch_time=batch_time, data_time=data_time,
                                 remain_time=remain_time,
                                 loss_meter=loss_meter,
                             loss_codebook_meter=loss_codebook_meter,
                                 nt_xent_loss=nt_xent_loss,
-                                loss_blendshapes_meter=loss_blendshapes_meter
+                                loss_blendshapes_meter=loss_blendshapes_meter,
+                                loss_delta_meter=loss_delta_meter
                                 ))
 
-    return loss_meter.avg, loss_blendshapes_meter.avg, loss_codebook_meter.avg, nt_xent_loss.avg, loss_reg_meter.avg, l2sp_meter.avg
+    return loss_meter.avg, loss_blendshapes_meter.avg, loss_codebook_meter.avg, nt_xent_loss.avg, loss_reg_meter.avg, loss_delta_meter.avg, l2sp_meter.avg
 
 def validate(val_loader, model, loss_fn, cfg):
     loss_meter = AverageMeter()

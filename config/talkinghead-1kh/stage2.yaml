@@ -58,7 +58,7 @@ TRAIN:
   workers: 10  # data load\er workers
   batch_size: 10 # 1  # batch size for training
   batch_size_val: 1  # batch size for validation during training, memory and speed tradeoff
-  base_lr: 1.0e-6 #0.0001 # USE 0.00001 FOR FULL DATASET TRAINING - 0.000001 FOR FINETUNNING
+  base_lr: 1.0e-6 # 1.0e-5 #0.0001 # USE 0.00001 FOR FULL DATASET TRAINING - 0.000001 FOR FINETUNNING
   StepLR: False
   warmup_steps: 1
   adaptive_lr: False
@@ -77,16 +77,18 @@ TRAIN:
   print_freq: 10
   save_freq: 1
   save_path:
-  weight: /mnt/fasttalk/logs/talkinghead/talkinghead-s2/model_40_joint_data_styled/model.pth.tar #/mnt/fasttalk/checkpoints_styled_300ep/model_s2_340.pth.tar
+  weight: /mnt/fasttalk/logs/talkinghead/talkinghead-s2/model_300_finetuned_all_artalkdata/model.pth.tar # /mnt/fasttalk/logs/talkinghead/talkinghead-s2/model_40_joint_data_styled/model.pth.tar #/mnt/fasttalk/checkpoints_styled_300ep/model_s2_340.pth.tar
   resume:
   evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
   eval_freq: 5
-  freeze_audio_encoder: False
-  l2sp_weight: 1.0e-5 #  1.0e-4 
+  freeze_audio_encoder: False # True
+  l2sp_weight: 1.0e-4 # 1.0e-5 #  
   l2sp_exclude: []
   kd_weight: 0.0
-  trainable_modules: []
+  blendshape_delta_weight: 1.0e-1
+  trainable_modules: [] #"style_frame_encoder", "style_proj", "style_audio_attn", "style_audio_gate", "transformer_decoder.layers.2", "transformer_decoder.layers.3"
   style_audio_causal: True
+  style_smooth_train: False
 
 Distributed:
   dist_url: tcp://127.0.0.1:6701
