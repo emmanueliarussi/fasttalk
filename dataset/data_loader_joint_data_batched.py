@@ -209,7 +209,7 @@ def read_data(args, test_config=False):
                         #gpose = savgol_filter(gpose, window_length=7, polyorder=2, axis=0)
                         
                         # Compute vertices for supervision in vq training
-                        exp_tensor    = torch.Tensor(expr)
+                        exp_tensor    = torch.Tensor(expr) 
                         jaw_tensor    = torch.Tensor(jaw) 
                         gpose_tensor  = torch.Tensor(gpose)
 

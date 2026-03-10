@@ -531,8 +531,18 @@ class CodeTalker(BaseModel):
             gt_delta = padded_blendshapes[:, 1:] - padded_blendshapes[:, :-1]
             delta_mask = blendshapes_mask[:, 1:] & blendshapes_mask[:, :-1]
             if delta_mask.any():
-                diff = (pred_delta - gt_delta) * delta_mask.unsqueeze(-1)
-                denom = delta_mask.sum().clamp(min=1).float() * diff.shape[-1]
+                diff_dim = pred_delta.shape[-1]
+                channel_mask = torch.ones(diff_dim, device=blendshapes_out.device, dtype=pred_delta.dtype)
+                pose_start = int(getattr(self.args, "pose_start_idx", 50))
+                pose_dim = int(getattr(self.args, "pose_dim", 6))
+                pose_start = max(0, min(pose_start, diff_dim))
+                pose_end = max(pose_start, min(pose_start + max(0, pose_dim), diff_dim))
+                if pose_end > pose_start:
+                    channel_mask[pose_start:pose_end] = 0.0
+
+                diff = (pred_delta - gt_delta) * delta_mask.unsqueeze(-1) * channel_mask.view(1, 1, -1)
+                active_channels = channel_mask.sum().clamp(min=1.0)
+                denom = delta_mask.sum().clamp(min=1).float() * active_channels
                 loss_delta = diff.pow(2).sum() / denom
             else:
                 loss_delta = torch.zeros((), device=blendshapes_out.device)
