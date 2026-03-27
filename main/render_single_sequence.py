@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from pytorch3d.transforms import matrix_to_euler_angles
+from scipy.signal import savgol_filter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -20,7 +21,7 @@ from renderer.renderer import Renderer
 DEFAULT_OUTPUT_DIR = "/mnt/fasttalk/demo/video"
 
 
-def load_sequence(npz_path, device):
+def load_sequence(npz_path, device, max_frames=None):
     data = np.load(npz_path)
     keys = set(data.files)
     print("npz keys:", sorted(keys))
@@ -58,6 +59,11 @@ def load_sequence(npz_path, device):
     jaw = jaw.reshape(-1, 3)
     eyelids = eyelids.reshape(-1, 2)
 
+    #gpose = gpose - gpose.mean(axis=0, keepdims=True)
+    #gpose = savgol_filter(gpose, window_length=7, polyorder=2, axis=0)
+
+    print(f"npz frame count: {exp.shape[0]}")
+
     print("exp shape:", exp.shape)
     print("gpose shape:", gpose.shape)
     print("jaw shape:", jaw.shape)
@@ -78,13 +84,15 @@ def load_sequence(npz_path, device):
             f"exp={exp.shape[0]} gpose={gpose.shape[0]} jaw={jaw.shape[0]} eyelids={eyelids.shape[0]}"
         )
 
-    max_frames = 500
-    if exp.shape[0] > max_frames:
-        print(f"Trimming to first {max_frames} frames")
-        exp = exp[:max_frames]
-        gpose = gpose[:max_frames]
-        jaw = jaw[:max_frames]
-        eyelids = eyelids[:max_frames]
+    if max_frames is not None:
+        if max_frames <= 0:
+            raise ValueError(f"max_frames must be > 0, got {max_frames}")
+        if exp.shape[0] > max_frames:
+            print(f"Trimming to first {max_frames} frames")
+            exp = exp[:max_frames]
+            gpose = gpose[:max_frames]
+            jaw = jaw[:max_frames]
+            eyelids = eyelids[:max_frames]
 
     return (
         torch.from_numpy(exp).float().to(device),
@@ -115,14 +123,29 @@ def get_vertices_from_blendshapes(flame_model, expr, gpose, jaw, device):
     return vertices
 
 
-def render_sequence(expr, gpose, jaw, eyelids, output_path, device):
+def render_sequence(expr, gpose, jaw, eyelids, output_path, device, render_batch_size=64):
+    if render_batch_size <= 0:
+        raise ValueError(f"render_batch_size must be > 0, got {render_batch_size}")
+
     flame_model = FLAMEModel(n_shape=300, n_exp=50).to(device)
     renderer = Renderer(render_full_head=True).to(device)
 
-    vertices = get_vertices_from_blendshapes(flame_model, expr, gpose, jaw, device)
-    cam = torch.tensor([5, 0, 0], dtype=torch.float32).unsqueeze(0).to(vertices.device)
-    cam = cam.expand(vertices.shape[0], -1)
-    frames = renderer.forward(vertices, cam)["rendered_img"]
+    with torch.no_grad():
+        vertices = get_vertices_from_blendshapes(flame_model, expr, gpose, jaw, device)
+
+    total_frames = vertices.shape[0]
+    print(f"Rendering {total_frames} frames with batch size {render_batch_size}")
+    rendered_chunks = []
+    with torch.no_grad():
+        for start in range(0, total_frames, render_batch_size):
+            end = min(start + render_batch_size, total_frames)
+            v_chunk = vertices[start:end]
+            cam = torch.tensor([5, 0, 0], dtype=torch.float32, device=v_chunk.device).unsqueeze(0)
+            cam = cam.expand(v_chunk.shape[0], -1)
+            chunk = renderer.forward(v_chunk, cam)["rendered_img"].detach().cpu()
+            rendered_chunks.append(chunk)
+
+    frames = torch.cat(rendered_chunks, dim=0)
 
     def update(frame_idx, pr_seq, axes):
         frame = pr_seq[frame_idx].detach().cpu().numpy().transpose(1, 2, 0)
@@ -156,14 +179,34 @@ def main():
     parser.add_argument("--npz", required=True, help="Path to input .npz file")
     parser.add_argument("--wav", required=True, help="Path to input .wav file (used for naming output)")
     parser.add_argument("--out_dir", default=DEFAULT_OUTPUT_DIR, help="Output directory for mp4")
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=None,
+        help="Optional frame cap. If omitted, render all frames from the npz.",
+    )
+    parser.add_argument(
+        "--render_batch_size",
+        type=int,
+        default=64,
+        help="Number of frames to render per GPU batch.",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    expr, gpose, jaw, eyelids = load_sequence(args.npz, device)
+    expr, gpose, jaw, eyelids = load_sequence(args.npz, device, max_frames=args.max_frames)
 
     os.makedirs(args.out_dir, exist_ok=True)
     output_path = build_output_path(args.npz, args.wav, args.out_dir)
-    duration_sec = render_sequence(expr, gpose, jaw, eyelids, output_path, device)
+    duration_sec = render_sequence(
+        expr,
+        gpose,
+        jaw,
+        eyelids,
+        output_path,
+        device,
+        render_batch_size=args.render_batch_size,
+    )
     print(f"Saved render to {output_path}")
 
     if args.wav and os.path.exists(args.wav):

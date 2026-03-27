@@ -132,14 +132,13 @@ def main_worker(gpu, ngpus_per_node, args):
         model = model.cuda()
 
     trainable_modules = getattr(cfg, "trainable_modules", [])
-    if getattr(cfg, "finetune_expr_affine", False):
+    if getattr(cfg, "finetune_expr_mlp", False):
         module = _unwrap_model(model)
+        for _, p in module.named_parameters():
+            p.requires_grad = False
         for name, p in module.named_parameters():
-            p.requires_grad = name in {"expr_scale", "expr_bias"}
-    elif getattr(cfg, "finetune_expr_adapter", False):
-        module = _unwrap_model(model)
-        for name, p in module.named_parameters():
-            p.requires_grad = name.startswith("expr_adapter") or name == "expr_adapter_scale"
+            if name.startswith("expr_mlp"):
+                p.requires_grad = True
     elif trainable_modules:
         module = _unwrap_model(model)
         for name, p in module.named_parameters():

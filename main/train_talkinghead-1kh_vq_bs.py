@@ -10,7 +10,7 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 import cv2
 
-from base.baseTrainer import poly_learning_rate, reduce_tensor, save_checkpoint
+from base.baseTrainer import load_state_dict, poly_learning_rate, reduce_tensor, save_checkpoint
 from base.utilities import get_parser, get_logger, main_process, AverageMeter
 from models import get_model
 from metrics.loss import calc_vq_loss
@@ -81,16 +81,13 @@ def main_worker(gpu, ngpus_per_node, args):
         model = model.cuda()
 
     # ####################### Load Pretrained ####################### #
-    #pretrained_checkpoint_path = "/mnt/fasttalk/logs/joint_data/joint_data_custom_s1/model_170_50k/model.pth.tar"
-    #pretrained_vq_checkpoint = torch.load(pretrained_checkpoint_path)
-
-    #if "state_dict" in pretrained_vq_checkpoint:
-    #    model.load_state_dict(pretrained_vq_checkpoint["state_dict"])
-    #else:
-    #    model.load_state_dict(pretrained_vq_checkpoint,map_location=lambda storage, loc: storage.cpu())
-
-    #print("Loaded pretrained model from: ", pretrained_checkpoint_path)
-    #print("Starting fine-tuning...")
+    checkpoint_path = getattr(cfg, "weight", None) or getattr(cfg, "resume", None)
+    if checkpoint_path:
+        logger.info("=> Loading checkpoint '{}'".format(checkpoint_path))
+        checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage.cpu())
+        state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+        load_state_dict(model, state_dict, strict=False)
+        logger.info("=> Loaded checkpoint '{}'".format(checkpoint_path))
 
     # ####################### Optimizer ####################### #
     if cfg.use_sgd:

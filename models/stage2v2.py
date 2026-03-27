@@ -284,6 +284,28 @@ class CodeTalker(BaseModel):
         for param in self.autoencoder.parameters():
             param.requires_grad = False
 
+        # Optional output MLP for distribution matching (kept off by default).
+        mlp_hidden = int(getattr(self.args, "expr_mlp_hidden_dim", 128))
+        mlp_layers = int(getattr(self.args, "expr_mlp_layers", 2))
+        mlp_layers = max(1, mlp_layers)
+        mlp_blocks = []
+        in_dim = args.blendshapes_dim
+        for _ in range(mlp_layers):
+            mlp_blocks.append(nn.Linear(in_dim, mlp_hidden))
+            mlp_blocks.append(nn.ReLU())
+            in_dim = mlp_hidden
+        mlp_blocks.append(nn.Linear(in_dim, args.blendshapes_dim))
+        self.expr_mlp = nn.Sequential(*mlp_blocks)
+
+        if not getattr(self.args, "finetune_expr_mlp", False):
+            for p in self.expr_mlp.parameters():
+                p.requires_grad = False
+
+    def _apply_output_mlp(self, blendshapes: torch.Tensor) -> torch.Tensor:
+        if getattr(self.args, "finetune_expr_mlp", False):
+            return self.expr_mlp(blendshapes)
+        return blendshapes
+
 
     def _style_view(self, blend, mask):
 
@@ -523,6 +545,7 @@ class CodeTalker(BaseModel):
         # Also make the deocoded blendshapes match the input blendshapes
         feat_out_q, _, _ = self.autoencoder.vq(feat_out) # Quantize the embedding
         blendshapes_out  = self.autoencoder.decode(feat_out_q, blendshapes_mask) # Decode the quantized embedding to get the blendshapes outputfeat_q_gt
+        blendshapes_out  = self._apply_output_mlp(blendshapes_out)
         loss_blendshapes = criterion(blendshapes_out, padded_blendshapes)  # L2 loss
 
         delta_weight = getattr(self.args, "blendshape_delta_weight", 0.0)
@@ -619,6 +642,7 @@ class CodeTalker(BaseModel):
         # quantization and decoding
         feat_out_q, _, _ = self.autoencoder.vq(feat_out)
         blendshapes_out  = self.autoencoder.decode(feat_out_q)
+        blendshapes_out  = self._apply_output_mlp(blendshapes_out)
 
         return blendshapes_out
 
@@ -682,8 +706,8 @@ class CodeTalker(BaseModel):
         # quantization and decoding
         #feat_out_q, _, _ = self.autoencoder.vq(feat_out)
         blendshapes_out  = self.autoencoder.decode(feat_out)
+        blendshapes_out  = self._apply_output_mlp(blendshapes_out)
 
         return blendshapes_out
-
 
 
