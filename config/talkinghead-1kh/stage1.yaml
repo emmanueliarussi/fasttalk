@@ -1,6 +1,6 @@
 DATA:
   dataset: TalkingHead-1KH
-  data_root: /mnt/Datasets/TalkingHead-1KH #/mnt/GSAMegaRepo/joint_data
+  data_root: /mnt/Datasets/ARTalk_data_subset #/mnt/Datasets/TalkingHead-1KH #/mnt/GSAMegaRepo/joint_data
   wav_path: wav
   vertices_path: npz
   template_file: flame_model/assets/FLAME_with_eye.pt
@@ -36,7 +36,7 @@ TRAIN:
   workers: 5  # data loader workers
   batch_size: 10 #1  # batch size for training
   batch_size_val: 1  # batch size for validation during training, memory and speed tradeoff
-  base_lr: 0.0001 #0.00001 
+  base_lr: 0.00001 #, for finetuning - # 0.0001 #for base training
   StepLR: True
   warmup_steps: 1
   adaptive_lr: False
@@ -55,8 +55,8 @@ TRAIN:
   print_freq: 10
   save_freq: 1
   save_path:
-  weight:
-  resume:
+  weight: /mnt/fasttalk/checkpoints_styled_300ep/model_s1.pth.tar # /mnt/fasttalk/logs/talkinghead/talkinghead-s1/model_10/model.pth.tar #/mnt/fasttalk/checkpoints_expressive_model/model_s1.pth.tar
+  resume: True
   evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
   eval_freq: 10
 
