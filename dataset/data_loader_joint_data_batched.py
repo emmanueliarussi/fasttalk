@@ -125,8 +125,13 @@ def read_data(args, test_config=False):
             if test_config and f not in test_list:
                 continue
             if f.endswith("wav"):
+                # Optional filtering by filename patterns (uncomment if needed)
+                # Load only WDA and WRA subjects, and skip synthetic files (if they exist)
                 #if not f.startswith(("WDA_", "WRA_")):
                 #    continue
+                # Load only synthetic files (if they exist)
+                if f.endswith(("_synth.wav")):
+                    continue
                 key          = f.replace("wav", "npy")
                 subject_id   = "_".join(key.split("_")[:-1])
                 blendshapes_path = os.path.join(vertices_path, f.replace("wav", "npz"))
