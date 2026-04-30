@@ -569,9 +569,12 @@ class CodeTalker(BaseModel):
         frame_num = hidden_states.shape[1]//2
 
         #  Build style_vec once per batch ───────────────────────────────
+        style_gpose_anchor = None  # anchor for autoregressive gpose feedback
         if target_style is not None:
             style_seq = self._style_seq_from_target(target_style, frame_num)
             style_mask = torch.ones(style_seq.shape[:2], dtype=torch.bool, device=style_seq.device)
+            # mean gpose from style — used to anchor feedback and stop drift compounding
+            style_gpose_anchor = target_style[0, :, 50:53].mean(dim=0, keepdim=True)  # [1, 3]
         else:
             style_seq = torch.zeros(
                 hidden_states.shape[0], frame_num, self.args.feature_dim,
@@ -613,7 +616,14 @@ class CodeTalker(BaseModel):
                 blendshapes_out_q = self.autoencoder.decode(feat_out_q)
 
             if i != frame_num - 1:
-                new_output        = self.blendshapes_map(blendshapes_out_q[:,-1,:]).unsqueeze(1)
+                last_frame = blendshapes_out_q[:, -1, :].clone()  # [B, 58]
+                if style_gpose_anchor is not None:
+                    # damp gpose feedback towards style mean to prevent drift compounding
+                    # while preserving natural head motion dynamics
+                    pose_feedback_damping = 0.5  # 0=fully anchored (stiff), 1=no correction (drifts)
+                    delta = last_frame[:, 50:53] - style_gpose_anchor
+                    last_frame[:, 50:53] = style_gpose_anchor + pose_feedback_damping * delta
+                new_output        = self.blendshapes_map(last_frame).unsqueeze(1)
                 blendshapes_emb   = torch.cat((blendshapes_emb, new_output), 1)
                 
         # quantization and decoding
@@ -632,9 +642,12 @@ class CodeTalker(BaseModel):
         frame_num = hidden_states.shape[1]//2
 
         #  Build style_vec once per batch ───────────────────────────────
+        style_gpose_anchor = None  # anchor for autoregressive gpose feedback
         if target_style is not None:
             style_seq = self._style_seq_from_target(target_style, frame_num)
             style_mask = torch.ones(style_seq.shape[:2], dtype=torch.bool, device=style_seq.device)
+            # mean gpose from style — used to anchor feedback and stop drift compounding
+            style_gpose_anchor = target_style[0, :, 50:53].mean(dim=0, keepdim=True)  # [1, 3]
         else:
             style_seq = torch.zeros(
                 hidden_states.shape[0], frame_num, self.args.feature_dim,
@@ -676,7 +689,14 @@ class CodeTalker(BaseModel):
                 blendshapes_out_q = self.autoencoder.decode(feat_out)
 
             if i != frame_num - 1:
-                new_output        = self.blendshapes_map(blendshapes_out_q[:,-1,:]).unsqueeze(1)
+                last_frame = blendshapes_out_q[:, -1, :].clone()  # [B, 58]
+                if style_gpose_anchor is not None:
+                    # damp gpose feedback towards style mean to prevent drift compounding
+                    # while preserving natural head motion dynamics
+                    pose_feedback_damping = 0.9  # 0=fully anchored (stiff), 1=no correction (drifts)
+                    delta = last_frame[:, 50:53] - style_gpose_anchor
+                    last_frame[:, 50:53] = style_gpose_anchor + pose_feedback_damping * delta
+                new_output        = self.blendshapes_map(last_frame).unsqueeze(1)
                 blendshapes_emb   = torch.cat((blendshapes_emb, new_output), 1)
                 
         # quantization and decoding

@@ -55,7 +55,7 @@ TRAIN:
   print_freq: 10
   save_freq: 1
   save_path:
-  weight: /mnt/fasttalk/checkpoints_styled_300ep/model_s1.pth.tar # /mnt/fasttalk/logs/talkinghead/talkinghead-s1/model_10/model.pth.tar #/mnt/fasttalk/checkpoints_expressive_model/model_s1.pth.tar
+  weight: /mnt/fasttalk/logs/talkinghead/talkinghead-s1/model_60_artalk_&_synth/model.pth.tar #/mnt/fasttalk/checkpoints_styled_300ep/model_s1.pth.tar # /mnt/fasttalk/logs/talkinghead/talkinghead-s1/model_10/model.pth.tar #/mnt/fasttalk/checkpoints_expressive_model/model_s1.pth.tar
   resume: True
   evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
   eval_freq: 10

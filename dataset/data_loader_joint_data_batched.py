@@ -130,8 +130,8 @@ def read_data(args, test_config=False):
                 #if not f.startswith(("WDA_", "WRA_")):
                 #    continue
                 # Load only synthetic files (if they exist)
-                if f.endswith(("_synth.wav")):
-                    continue
+                #if f.endswith(("_synth.wav")):
+                #    continue
                 key          = f.replace("wav", "npy")
                 subject_id   = "_".join(key.split("_")[:-1])
                 blendshapes_path = os.path.join(vertices_path, f.replace("wav", "npz"))
@@ -211,7 +211,7 @@ def read_data(args, test_config=False):
                         gpose = gpose - gpose.mean(axis=0, keepdims=True)
 
                         # Apply Savitzky-Golay filter along the time axis for gpose (removes tracker's flickering) (axis=0)
-                        #gpose = savgol_filter(gpose, window_length=7, polyorder=2, axis=0)
+                        gpose = savgol_filter(gpose, window_length=7, polyorder=2, axis=0)
                         
                         # Compute vertices for supervision in vq training
                         exp_tensor    = torch.Tensor(expr) 
